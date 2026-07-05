@@ -1,0 +1,10 @@
+# Databricks App — Plan financier par leviers (assurance individuelle)
+# La ressource « sql_warehouse » doit être ajoutée à l'app lors de sa création
+# (App resources -> + Add resource -> SQL warehouse -> clé : sql_warehouse).
+command: ["streamlit", "run", "app.py"]
+
+env:
+  - name: "DATABRICKS_WAREHOUSE_ID"
+    valueFrom: "sql_warehouse"
+  - name: "STREAMLIT_BROWSER_GATHER_USAGE_STATS"
+    value: "false"

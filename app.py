@@ -1,0 +1,678 @@
+# -*- coding: utf-8 -*-
+"""
+📊 Plan financier simplifié par leviers — Assurance individuelle (vie)
+Databricks App (Streamlit) · Phase 2 du POC · IFRS 17
+
+⚠️ Données synthétiques à des fins de démonstration.
+
+Même moteur et mêmes tables que le notebook Phase 1 (schéma plan_assurance_ind_v1).
+- Les curseurs recalculent tout INSTANTANÉMENT (aucune écriture requise).
+- Le bouton « Écrire le scénario » fait le write-back Delta (DELETE ciblé + INSERT)
+  via le SQL warehouse rattaché à l'app (ressource `sql_warehouse` de app.yaml).
+- Si le warehouse n'est pas joignable, l'app bascule en MODE LOCAL : tout fonctionne
+  sauf le write-back et la comparaison des scénarios déjà écrits.
+"""
+
+import os
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+
+# Connecteur Databricks (présent dans l'app ; absent en test local -> mode local)
+try:
+    from databricks import sql as dbsql
+    from databricks.sdk.core import Config
+    DBX_DISPONIBLE = True
+except ImportError:
+    DBX_DISPONIBLE = False
+
+# ==============================================================================
+# 1. CONSTANTES MÉTIER (identiques au notebook Phase 1)
+# ==============================================================================
+SCHEMA_DEFAUT = "plan_assurance_ind_v1"
+ANNEES = list(range(2025, 2031))
+N = len(ANNEES)
+
+PRODUITS = [
+    "Vie entière avec participation", "Vie entière à paiements limités",
+    "Autres vies entières", "Temporaires", "Maladies graves",
+    "Autres invalidité et maladie", "Option dépôt supplémentaire (ODS)", "Autres",
+]
+CANAUX = ["Indépendants", "Desjardins", "Agents Desjardins"]
+
+VENTES_2025 = np.array([39510, 5400, 8660, 24723, 20940, 4300, 500, 2500], dtype=float)
+VENTES_2030 = np.array([68674, 8520, 13970, 35680, 32020, 6330, 1266, 3540], dtype=float)
+JALONS_TOTAUX = np.array([106533, 116700, 129000, 142000, 155500, 170000], dtype=float)
+
+RSI_MATRICE = pd.DataFrame(
+    {
+        "Indépendants":      [5.6, 1.8, 9.2, 7.3, 17.1, np.nan, np.nan, np.nan],
+        "Desjardins":        [3.1, 16.7, 55.6, 6.9, 5.2, np.nan, np.nan, np.nan],
+        "Agents Desjardins": [np.nan, 1.4, -1.2, -10.5, -0.6, -5.3, np.nan, np.nan],
+    },
+    index=PRODUITS,
+)
+VAN_2025 = np.array([-12848, 3005, 900, 1177, 748, -2024, 0, 0], dtype=float)
+MARGE_VAN = VAN_2025 / VENTES_2025
+
+BASE_COUTS = np.array([95.0, 48.0, 14.6])         # acquisition / attribuables / non attr. (M$)
+POLICES_2025, POLICES_2030 = 52083.0, 72000.0
+
+COUL = {"vert": "#00874E", "rouge": "#C0392B", "bleu": "#1F5673",
+        "gris": "#7F8C8D", "or": "#B8860B", "fond": "#F7F7F5"}
+plt.rcParams.update({
+    "figure.facecolor": "white", "axes.facecolor": COUL["fond"],
+    "axes.edgecolor": "#DDDDDD", "axes.grid": True, "grid.color": "#E3E3E0",
+    "grid.linewidth": 0.7, "font.size": 11, "axes.titlesize": 13,
+    "axes.titleweight": "bold",
+})
+
+def fmt_fr(x, dec=0, suffixe=""):
+    return f"{x:,.{dec}f}".replace(",", " ").replace(".", ",") + suffixe
+
+def fmt_m(x, dec=0):
+    return fmt_fr(x, dec, " M$")
+
+def fmt_pct(x, dec=1):
+    return fmt_fr(x, dec, " %")
+
+# ==============================================================================
+# 2. BASELINE DES VENTES (déterministe, seed 42 — identique au notebook)
+# ==============================================================================
+@st.cache_data(show_spinner=False)
+def ventes_baseline():
+    rng = np.random.default_rng(42)
+    tx = (VENTES_2030 / VENTES_2025) ** (1 / (N - 1))
+    v = np.array([VENTES_2025 * tx**t for t in range(N)]).T
+    bruit = 1 + rng.uniform(-0.015, 0.015, size=v.shape)
+    bruit[:, 0] = 1.0
+    bruit[:, -1] = 1.0
+    v *= bruit
+    v *= JALONS_TOTAUX / v.sum(axis=0)
+    return v
+
+VENTES_BASE = ventes_baseline()
+
+# ==============================================================================
+# 3. MOTEUR DE CALCUL (copie conforme du notebook Phase 1)
+# ==============================================================================
+def calculer_scenario(scenario_id, fact_volume, accent_mix, parts_canal,
+                      rendement, g_acq, g_attr, g_na):
+    t_idx = np.arange(N)
+    rsi_mat = RSI_MATRICE.to_numpy()
+    poids_canal_base = np.array([0.60, 0.25, 0.15])
+    with np.errstate(invalid="ignore"):
+        denom = np.nansum(~np.isnan(rsi_mat) * poids_canal_base, axis=1)
+        score = np.nansum(np.where(np.isnan(rsi_mat), 0, rsi_mat) * poids_canal_base, axis=1) / \
+                np.where(denom == 0, 1, denom)
+    score_c = (score - score.mean()) / 10.0
+
+    ventes_scen = np.zeros_like(VENTES_BASE)
+    for j in range(N):
+        w = VENTES_BASE[:, j] / VENTES_BASE[:, j].sum()
+        w_adj = np.clip(w * (1 + accent_mix * score_c), 1e-6, None)
+        w_adj = w_adj / w_adj.sum()
+        ventes_scen[:, j] = VENTES_BASE[:, j].sum() * fact_volume * w_adj
+
+    ventes_tot_m = ventes_scen.sum(axis=0) / 1000.0
+    ventes_pc = ventes_scen[:, :, None] * np.array(parts_canal)[None, None, :]
+
+    rsi_adj = rsi_mat + (rendement - 0.035) * 100 * 0.8
+    masque = ~np.isnan(rsi_mat)
+    rsi_nb = np.array([
+        np.nansum(np.where(masque, rsi_adj, 0) * ventes_pc[:, j, :]) /
+        max(1e-9, (ventes_pc[:, j, :] * masque).sum())
+        for j in range(N)
+    ])
+
+    van_k = MARGE_VAN[:, None] * ventes_scen + ventes_scen * (rendement - 0.035) * 2.0
+    van_tot_m = van_k.sum(axis=0) / 1000.0
+
+    marge_csm = np.linspace(0.75, 1.03, N)
+    nb_csm = marge_csm * ventes_tot_m
+    chg_hyp = np.array([-37, -25, -12, 0, 10, 20], dtype=float)
+    exp_csm = 12.0
+    csm_open, csm_close, csm_release, csm_interet = [], [], [], []
+    solde = 1937.0
+    for j in range(N):
+        rel = 0.071 * solde
+        inte = 0.0315 * solde * (rendement / 0.035)
+        fin = solde - rel + nb_csm[j] + inte + exp_csm + chg_hyp[j]
+        csm_open.append(solde); csm_release.append(rel)
+        csm_interet.append(inte); csm_close.append(fin)
+        solde = fin
+    csm_open, csm_close = np.array(csm_open), np.array(csm_close)
+    csm_release, csm_interet = np.array(csm_release), np.array(csm_interet)
+
+    ra_release = 31.0 * 1.05 ** t_idx
+    profit_attendu = csm_release + ra_release
+    impact_ventes = 0.11 * van_tot_m
+    experience = 15.0 + 1.5 * t_idx
+
+    acq = BASE_COUTS[0] * (1 + g_acq) ** t_idx
+    attr = BASE_COUTS[1] * (1 + g_attr) ** t_idx
+    na = BASE_COUTS[2] * (1 + g_na) ** t_idx
+    depenses_src = -(attr + na + 0.30 * acq)
+
+    capital = np.linspace(464.0, 581.0, N) * (0.85 + 0.15 * fact_volume)
+    actifs = capital * 5.6
+    accretion_passifs = np.array([0.0, 26.0, 34.0, 41.0, 45.0, 49.0])
+    interet_marche = actifs * rendement - accretion_passifs
+
+    activites = profit_attendu + impact_ventes + experience
+    exploitation = activites + interet_marche + depenses_src
+    impots = np.where(exploitation > 0, 0.24 * exploitation, 0.0)
+    resultat_net = exploitation - impots
+
+    echelle_vol = 0.85 + 0.15 * fact_volume
+    produits_ass = np.linspace(669.0, 806.0, N) * echelle_vol
+    charges_ass = np.linspace(450.0, 561.0, N) * echelle_vol
+    reassurance = activites - (produits_ass - charges_ass)
+    rsi_global = resultat_net / capital * 100.0
+
+    polices = np.linspace(POLICES_2025, POLICES_2030, N) * fact_volume
+    cout_par_police = (acq + attr + na) * 1_000_000.0 / polices
+
+    return {
+        "scenario_id": scenario_id, "ventes_scen": ventes_scen, "ventes_pc": ventes_pc,
+        "rsi_adj": rsi_adj, "masque": masque, "van_k": van_k,
+        "resultat_net": resultat_net, "exploitation": exploitation,
+        "rsi_global": rsi_global, "rsi_nb": rsi_nb, "van_tot_m": van_tot_m,
+        "csm_open": csm_open, "csm_close": csm_close, "csm_release": csm_release,
+        "csm_interet": csm_interet, "nb_csm": nb_csm, "chg_hyp": chg_hyp,
+        "exp_csm": exp_csm, "profit_attendu": profit_attendu,
+        "impact_ventes": impact_ventes, "experience": experience,
+        "depenses": depenses_src, "interet_marche": interet_marche,
+        "capital": capital, "cout_par_police": cout_par_police, "polices": polices,
+        "produits_ass": produits_ass, "charges_ass": charges_ass,
+        "reassurance": reassurance, "impots": impots, "activites": activites,
+    }
+
+PARAMS_BASE = dict(fact_volume=1.0, accent_mix=0.0, parts_canal=[0.60, 0.25, 0.15],
+                   rendement=0.035, g_acq=0.035, g_attr=0.030, g_na=0.020)
+
+@st.cache_data(show_spinner=False)
+def resultat_baseline():
+    return calculer_scenario("Base", **PARAMS_BASE)
+
+# ==============================================================================
+# 4. CONNEXION AU SQL WAREHOUSE + WRITE-BACK DELTA
+# ==============================================================================
+@st.cache_resource(show_spinner=False)
+def connexion():
+    """Connexion au warehouse rattaché à l'app (ressource sql_warehouse d'app.yaml).
+    Retourne None si indisponible -> mode local."""
+    if not DBX_DISPONIBLE:
+        return None
+    wid = os.getenv("DATABRICKS_WAREHOUSE_ID")
+    if not wid:
+        return None
+    try:
+        cfg = Config()  # authentification automatique du principal de service de l'app
+        return dbsql.connect(
+            server_hostname=cfg.host.replace("https://", ""),
+            http_path=f"/sql/1.0/warehouses/{wid}",
+            credentials_provider=lambda: cfg.authenticate,
+        )
+    except Exception:
+        return None
+
+def requete(sql_txt):
+    conn = connexion()
+    with conn.cursor() as cur:
+        cur.execute(sql_txt)
+        cols = [c[0] for c in cur.description] if cur.description else []
+        return pd.DataFrame(cur.fetchall(), columns=cols)
+
+def executer(sql_txt):
+    conn = connexion()
+    with conn.cursor() as cur:
+        cur.execute(sql_txt)
+
+def esc(s):
+    return str(s).replace("'", "''")
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def detecter_catalog():
+    try:
+        return requete("SELECT current_catalog() AS c")["c"].iloc[0]
+    except Exception:
+        return "workspace"
+
+def qualifier(table, catalog, schema):
+    return f"`{catalog}`.`{schema}`.`{table}`"
+
+# --- Schémas des tables (créées si le notebook Phase 1 n'a pas encore tourné) ---
+DDL = {
+    "overlay_drivers_slv": ("(scenario_id STRING, levier STRING, valeur DOUBLE, "
+                            "valeur_baseline DOUBLE, horodatage STRING)"),
+    "forecast_output_gld": ("(scenario_id STRING, annee BIGINT, section STRING, "
+                            "ligne STRING, ordre BIGINT, montant_m DOUBLE)"),
+    "kpi_gld": ("(scenario_id STRING, annee BIGINT, niveau STRING, produit STRING, "
+                "canal STRING, kpi STRING, valeur DOUBLE, unite STRING)"),
+    "dim_scenario_gld": ("(scenario_id STRING, horodatage STRING, facteur_volume DOUBLE, "
+                         "accent_croissance DOUBLE, part_independants DOUBLE, "
+                         "part_desjardins DOUBLE, part_agents DOUBLE, rendement_placement DOUBLE, "
+                         "croiss_couts_acquisition DOUBLE, croiss_couts_attribuables DOUBLE, "
+                         "croiss_couts_non_attribuables DOUBLE)"),
+}
+
+def inserer(table, colonnes, lignes, catalog, schema, lot=400):
+    """INSERT INTO par lots ; les chaînes sont échappées, None -> NULL."""
+    def val(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return "NULL"
+        if isinstance(v, str):
+            return f"'{esc(v)}'"
+        return f"{v}"
+    for i in range(0, len(lignes), lot):
+        vals = ", ".join("(" + ", ".join(val(v) for v in ligne) + ")"
+                         for ligne in lignes[i:i + lot])
+        executer(f"INSERT INTO {qualifier(table, catalog, schema)} "
+                 f"({', '.join(colonnes)}) VALUES {vals}")
+
+def construire_lignes(res, params, scenario_id):
+    """Prépare les lignes overlay / forecast / kpi / dim (mêmes formats que Phase 1)."""
+    horo = datetime.now().isoformat(timespec="seconds")
+    pc = params["parts_canal"]
+
+    overlay = [
+        (scenario_id, "A_facteur_volume", params["fact_volume"], 1.00, horo),
+        (scenario_id, "B_accent_croissance_mix", params["accent_mix"], 0.00, horo),
+        (scenario_id, "C_part_independants", pc[0], 0.60, horo),
+        (scenario_id, "C_part_desjardins", pc[1], 0.25, horo),
+        (scenario_id, "C_part_agents", pc[2], 0.15, horo),
+        (scenario_id, "D_rendement_placement", params["rendement"], 0.035, horo),
+        (scenario_id, "E_croiss_couts_acquisition", params["g_acq"], 0.035, horo),
+        (scenario_id, "E_croiss_couts_attribuables", params["g_attr"], 0.030, horo),
+        (scenario_id, "E_croiss_couts_non_attrib", params["g_na"], 0.020, horo),
+    ]
+
+    sections = {
+        "etat_resultats": [
+            ("Produits d'assurance", res["produits_ass"]),
+            ("Charges d'assurance", -res["charges_ass"]),
+            ("Réassurance nette", res["reassurance"]),
+            ("Résultats des activités d'assurance", res["activites"]),
+            ("Résultat financier", res["interet_marche"]),
+            ("Résultats autres", res["depenses"]),
+            ("Résultat d'exploitation", res["exploitation"]),
+            ("Impôts", -res["impots"]),
+            ("Résultat net", res["resultat_net"]),
+        ],
+        "sources_benefices": [
+            ("Profit attendu (CSM + RA)", res["profit_attendu"]),
+            ("Impact des ventes", res["impact_ventes"]),
+            ("Expérience", res["experience"]),
+            ("Dépenses", res["depenses"]),
+            ("Intérêt et marché", res["interet_marche"]),
+            ("Résultat d'exploitation", res["exploitation"]),
+        ],
+        "csm_rollforward": [
+            ("Solde CSM départ", res["csm_open"]),
+            ("Profit attendu relâché", -res["csm_release"]),
+            ("Impact des ventes profitables", res["nb_csm"]),
+            ("Intérêt et marché", res["csm_interet"]),
+            ("Expérience", np.full(N, res["exp_csm"])),
+            ("Changements d'hypothèses", res["chg_hyp"]),
+            ("Solde CSM fin", res["csm_close"]),
+        ],
+        "capital": [
+            ("Capital à rémunérer moyen", res["capital"]),
+            ("Actifs investis (proxy)", res["capital"] * 5.6),
+        ],
+    }
+    forecast = []
+    for section, lignes_sec in sections.items():
+        for ordre, (ligne, serie) in enumerate(lignes_sec, start=1):
+            for j, a in enumerate(ANNEES):
+                forecast.append((scenario_id, a, section, ligne, ordre,
+                                 round(float(serie[j]), 2)))
+
+    kpi = []
+    for j, a in enumerate(ANNEES):
+        for nom, valr, unite in [
+            ("resultat_net_m", res["resultat_net"][j], "M$"),
+            ("resultat_exploitation_m", res["exploitation"][j], "M$"),
+            ("rsi_global_pct", res["rsi_global"][j], "%"),
+            ("rsi_nouvelles_affaires_pct", res["rsi_nb"][j], "%"),
+            ("van_totale_m", res["van_tot_m"][j], "M$"),
+            ("csm_solde_fin_m", res["csm_close"][j], "M$"),
+            ("capital_a_remunerer_m", res["capital"][j], "M$"),
+            ("cout_acquisition_par_police_$", res["cout_par_police"][j], "$"),
+            ("polices_emises", res["polices"][j], "nb"),
+            ("ventes_totales_k", res["ventes_scen"][:, j].sum(), "K$"),
+        ]:
+            kpi.append((scenario_id, a, "global", "Tous", "Tous", nom,
+                        round(float(valr), 2), unite))
+        for i, p in enumerate(PRODUITS):
+            kpi.append((scenario_id, a, "produit", p, "Tous", "ventes_k",
+                        round(float(res["ventes_scen"][i, j]), 1), "K$"))
+            kpi.append((scenario_id, a, "produit", p, "Tous", "van_k",
+                        round(float(res["van_k"][i, j]), 1), "K$"))
+            for c_i, c in enumerate(CANAUX):
+                kpi.append((scenario_id, a, "produit_canal", p, c, "ventes_k",
+                            round(float(res["ventes_pc"][i, j, c_i]), 1), "K$"))
+                if res["masque"][i, c_i]:
+                    kpi.append((scenario_id, a, "produit_canal", p, c, "rsi_pct",
+                                round(float(res["rsi_adj"][i, c_i]), 2), "%"))
+
+    dim = [(scenario_id, horo, params["fact_volume"], params["accent_mix"],
+            pc[0], pc[1], pc[2], params["rendement"], params["g_acq"],
+            params["g_attr"], params["g_na"])]
+    return overlay, forecast, kpi, dim
+
+def ecrire_scenario(res, params, scenario_id, catalog, schema):
+    """Write-back Delta par scénario : CREATE IF NOT EXISTS + DELETE ciblé + INSERT.
+    La baseline et les autres scénarios ne bougent jamais. Idempotent."""
+    executer(f"CREATE SCHEMA IF NOT EXISTS `{catalog}`.`{schema}`")
+    for t, ddl in DDL.items():
+        executer(f"CREATE TABLE IF NOT EXISTS {qualifier(t, catalog, schema)} {ddl}")
+
+    overlay, forecast, kpi, dim = construire_lignes(res, params, scenario_id)
+    sid = esc(scenario_id)
+    jeux = [
+        ("overlay_drivers_slv",
+         ["scenario_id", "levier", "valeur", "valeur_baseline", "horodatage"], overlay),
+        ("forecast_output_gld",
+         ["scenario_id", "annee", "section", "ligne", "ordre", "montant_m"], forecast),
+        ("kpi_gld",
+         ["scenario_id", "annee", "niveau", "produit", "canal", "kpi", "valeur", "unite"], kpi),
+        ("dim_scenario_gld",
+         ["scenario_id", "horodatage", "facteur_volume", "accent_croissance",
+          "part_independants", "part_desjardins", "part_agents", "rendement_placement",
+          "croiss_couts_acquisition", "croiss_couts_attribuables",
+          "croiss_couts_non_attribuables"], dim),
+    ]
+    for table, cols, lignes in jeux:
+        executer(f"DELETE FROM {qualifier(table, catalog, schema)} "
+                 f"WHERE scenario_id = '{sid}'")
+        inserer(table, cols, lignes, catalog, schema)
+    return sum(len(l) for _, _, l in jeux)
+
+@st.cache_data(show_spinner=False, ttl=20)
+def lire_kpi_scenarios(catalog, schema):
+    return requete(
+        f"SELECT scenario_id, annee, kpi, valeur FROM {qualifier('kpi_gld', catalog, schema)} "
+        f"WHERE niveau = 'global' AND kpi IN "
+        f"('rsi_global_pct','resultat_net_m','van_totale_m','csm_solde_fin_m')"
+    )
+
+# ==============================================================================
+# 5. VISUELS (matplotlib — identiques à la Phase 1)
+# ==============================================================================
+def fig_waterfall(etiquettes, valeurs, titre, plafond=None):
+    fig, ax = plt.subplots(figsize=(11, 4.6))
+    n = len(valeurs)
+    ax.set_ylim(0, plafond or max(np.cumsum(valeurs[:-1]).max(), valeurs[0], valeurs[-1]) * 1.22)
+    cumul = 0.0
+    for i, (lab, v) in enumerate(zip(etiquettes, valeurs)):
+        est_total = (i == n - 1) or (i == 0 and "Solde" in lab)
+        if est_total:
+            ax.bar(i, v, bottom=0, color=COUL["bleu"], width=0.62, zorder=3)
+            sommet = v
+            if i == 0:
+                cumul = v
+        else:
+            ax.bar(i, v, bottom=cumul, color=COUL["vert"] if v >= 0 else COUL["rouge"],
+                   width=0.62, zorder=3)
+            sommet = cumul + max(v, 0)
+            cumul += v
+        ax.text(i, sommet + ax.get_ylim()[1] * 0.015, fmt_fr(v, 0),
+                ha="center", va="bottom", fontsize=10, fontweight="bold")
+        if not est_total and i < n - 1:
+            ax.hlines(cumul, i + 0.31, i + 1 - 0.31, color=COUL["gris"],
+                      linewidth=1, linestyle=":", zorder=2)
+    ax.set_xticks(range(n))
+    ax.set_xticklabels([e.replace(" ", "\n", 1) for e in etiquettes], fontsize=9)
+    ax.set_title(titre)
+    ax.set_ylabel("M$")
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: fmt_fr(x)))
+    fig.tight_layout()
+    return fig
+
+def fig_heatmap(rsi_adj, rendement, scenario_id):
+    fig, ax = plt.subplots(figsize=(8.5, 5.4))
+    donnees = np.ma.masked_invalid(rsi_adj)
+    cmap = plt.get_cmap("RdYlGn").copy()
+    cmap.set_bad(color="#E8E8E4")
+    im = ax.imshow(donnees, cmap=cmap, vmin=-12, vmax=20, aspect="auto")
+    ax.set_xticks(range(len(CANAUX)), CANAUX, fontsize=10.5)
+    ax.set_yticks(range(len(PRODUITS)),
+                  [p.replace("Option dépôt supplémentaire (ODS)", "ODS") for p in PRODUITS],
+                  fontsize=9.5)
+    for i in range(len(PRODUITS)):
+        for j in range(len(CANAUX)):
+            v = rsi_adj[i, j]
+            if np.isnan(v):
+                ax.text(j, i, "n.d.", ha="center", va="center",
+                        color=COUL["gris"], fontsize=8.5)
+            else:
+                ax.text(j, i, fmt_pct(v), ha="center", va="center", fontsize=9.5,
+                        fontweight="bold", color="black" if -8 < v < 30 else "white")
+    ax.set_title(f"RSI des ventes par produit × canal — « {scenario_id} » · "
+                 f"rendement {rendement*100:.2f} %")
+    fig.colorbar(im, ax=ax, shrink=0.85).set_label("RSI (%)")
+    ax.grid(False)
+    fig.tight_layout()
+    return fig
+
+def fig_trajectoires(res, res_base, scenario_id):
+    fig, axes = plt.subplots(1, 3, figsize=(13, 3.8))
+    for ax, (titre, cle, unite) in zip(axes, [
+        ("Résultat net (M$)", "resultat_net", "M$"),
+        ("RSI global (%)", "rsi_global", "%"),
+        ("Coût d'acquisition / police ($)", "cout_par_police", "$"),
+    ]):
+        ax.plot(ANNEES, res_base[cle], marker="o", linewidth=2, color=COUL["gris"],
+                linestyle="--", label="Base")
+        ax.plot(ANNEES, res[cle], marker="o", linewidth=2.5, color=COUL["vert"],
+                label=scenario_id)
+        ax.set_title(titre)
+        ax.set_xticks(ANNEES)
+        ax.tick_params(labelsize=9)
+        ax.legend(fontsize=8.5)
+        ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: fmt_fr(x)))
+    fig.tight_layout()
+    return fig
+
+def afficher_fig(fig):
+    st.pyplot(fig, width="stretch")
+    plt.close(fig)
+
+# ==============================================================================
+# 6. INTERFACE
+# ==============================================================================
+st.set_page_config(page_title="Plan financier par leviers — Assurance individuelle",
+                   page_icon="📊", layout="wide")
+
+st.title("📊 Plan financier simplifié par leviers — Assurance individuelle")
+st.caption("⚠️ **Données synthétiques à des fins de démonstration** · IFRS 17 · "
+           "2025 (estimé) → 2030 · POC Databricks App")
+
+# ---- Barre latérale : leviers ------------------------------------------------
+st.sidebar.header("🎛️ Leviers du scénario")
+scenario_id = st.sidebar.text_input("Nom du scénario", "Base",
+                                    help="Clé du write-back : « Base » = baseline.").strip() or "Base"
+
+fact_volume = st.sidebar.slider("A — Volume de ventes global (×)", 0.80, 1.30, 1.00, 0.01)
+accent_mix = st.sidebar.slider("B — Accent mix produits (→ meilleur RSI)", -1.0, 1.0, 0.0, 0.05)
+
+with st.sidebar.expander("C — Mix canal (%)", expanded=False):
+    p_ind = st.slider("Indépendants", 0, 100, 60, 1)
+    p_dsj = st.slider("Desjardins", 0, 100, 25, 1)
+    p_agt = st.slider("Agents Desjardins", 0, 100, 15, 1)
+    total_c = max(1, p_ind + p_dsj + p_agt)
+    parts_canal = [p_ind / total_c, p_dsj / total_c, p_agt / total_c]
+    st.caption("Renormalisé : " + " / ".join(f"{p*100:.0f} %" for p in parts_canal))
+
+rendement = st.sidebar.slider("D — Rendement de placement (%)", 2.50, 5.00, 3.50, 0.05) / 100.0
+
+with st.sidebar.expander("E — Croissance des dépenses (%/an)", expanded=False):
+    g_acq = st.slider("Coûts d'acquisition", 0.0, 8.0, 3.5, 0.1) / 100.0
+    g_attr = st.slider("Coûts attribuables", 0.0, 8.0, 3.0, 0.1) / 100.0
+    g_na = st.slider("Coûts non attribuables", 0.0, 8.0, 2.0, 0.1) / 100.0
+
+params = dict(fact_volume=float(fact_volume), accent_mix=float(accent_mix),
+              parts_canal=[float(p) for p in parts_canal], rendement=float(rendement),
+              g_acq=float(g_acq), g_attr=float(g_attr), g_na=float(g_na))
+
+# ---- Recalcul instantané (moment « wow » A) ------------------------------------
+res = calculer_scenario(scenario_id, **params)
+res_base = resultat_baseline()
+
+# ---- Connexion / write-back -----------------------------------------------------
+conn_ok = connexion() is not None
+if conn_ok:
+    CATALOG = detecter_catalog()
+else:
+    CATALOG = "workspace"
+with st.sidebar.expander("⚙️ Avancé (catalog / schéma)"):
+    CATALOG = st.text_input("Catalog", CATALOG)
+    SCHEMA = st.text_input("Schéma", SCHEMA_DEFAUT)
+
+st.sidebar.divider()
+if conn_ok:
+    if st.sidebar.button("💾 Écrire le scénario dans Delta", type="primary",
+                         width="stretch"):
+        try:
+            with st.spinner(f"Write-back du scénario « {scenario_id} »…"):
+                nb = ecrire_scenario(res, params, scenario_id, CATALOG, SCHEMA)
+            lire_kpi_scenarios.clear()
+            st.sidebar.success(f"✅ « {scenario_id} » écrit ({nb} lignes). "
+                               f"Baseline et autres scénarios intacts.")
+        except Exception as e:
+            st.sidebar.error(f"Échec du write-back : {e}")
+else:
+    st.sidebar.warning("🔌 **Mode local** — SQL warehouse non joignable : les curseurs "
+                       "fonctionnent, mais pas le write-back ni la lecture des scénarios "
+                       "déjà écrits. Vérifier la ressource `sql_warehouse` de l'app et les "
+                       "droits du principal de service sur le schéma.")
+
+# ---- Cartes KPI (avec écart vs Base) --------------------------------------------
+annee_focus = st.select_slider("Année mise en vedette", options=ANNEES, value=2030)
+jf = ANNEES.index(annee_focus)
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Résultat net", fmt_m(res["resultat_net"][jf]),
+          delta=fmt_m(res["resultat_net"][jf] - res_base["resultat_net"][jf]) + " vs Base")
+c2.metric("RSI global (ROE)", fmt_pct(res["rsi_global"][jf]),
+          delta=fmt_fr(res["rsi_global"][jf] - res_base["rsi_global"][jf], 1, " pt vs Base"))
+c3.metric("VAN des affaires nouvelles", fmt_m(res["van_tot_m"][jf], 1),
+          delta=fmt_m(res["van_tot_m"][jf] - res_base["van_tot_m"][jf], 1) + " vs Base")
+c4.metric("Solde CSM (fin)", fmt_m(res["csm_close"][jf]),
+          delta=fmt_m(res["csm_close"][jf] - res_base["csm_close"][jf]) + " vs Base")
+
+# ---- Onglets ---------------------------------------------------------------------
+ong1, ong2, ong3, ong4 = st.tabs(
+    ["📊 Tableau de bord", "🔁 Roll-forward CSM", "⚖️ Comparaison de scénarios", "📄 Détail"]
+)
+
+with ong1:
+    gauche, droite = st.columns([1.15, 1])
+    with gauche:
+        afficher_fig(fig_waterfall(
+            ["Profit attendu (CSM + RA)", "Impact des ventes", "Expérience",
+             "Dépenses", "Intérêt et marché", "Résultat d'exploitation"],
+            [res["profit_attendu"][jf], res["impact_ventes"][jf], res["experience"][jf],
+             res["depenses"][jf], res["interet_marche"][jf], res["exploitation"][jf]],
+            f"Sources de bénéfices {annee_focus} — « {scenario_id} » (M$)"))
+    with droite:
+        afficher_fig(fig_heatmap(res["rsi_adj"], rendement, scenario_id))
+    afficher_fig(fig_trajectoires(res, res_base, scenario_id))
+
+with ong2:
+    afficher_fig(fig_waterfall(
+        ["Solde CSM départ", "Profit attendu relâché", "Impact des ventes profitables",
+         "Intérêt et marché", "Expérience", "Changements d'hypothèses", "Solde CSM fin"],
+        [res["csm_open"][jf], -res["csm_release"][jf], res["nb_csm"][jf],
+         res["csm_interet"][jf], res["exp_csm"], res["chg_hyp"][jf], res["csm_close"][jf]],
+        f"Roll-forward du CSM {annee_focus} — « {scenario_id} » (M$)",
+        plafond=max(res["csm_open"][jf], res["csm_close"][jf]) * 1.18))
+    st.dataframe(pd.DataFrame({
+        "Année": ANNEES,
+        "Solde départ (M$)": res["csm_open"].round(0),
+        "Relâche (M$)": (-res["csm_release"]).round(0),
+        "Ventes profitables (M$)": res["nb_csm"].round(0),
+        "Intérêt (M$)": res["csm_interet"].round(0),
+        "Solde fin (M$)": res["csm_close"].round(0),
+    }), hide_index=True, width="stretch")
+
+with ong3:
+    st.markdown("**Scénarios écrits dans `kpi_gld`** (notebook Phase 1 ou bouton "
+                "« Écrire le scénario »). Le scénario courant *(non écrit)* est superposé "
+                "en pointillé.")
+    if conn_ok:
+        try:
+            kpi_all = lire_kpi_scenarios(CATALOG, SCHEMA)
+        except Exception:
+            kpi_all = pd.DataFrame(columns=["scenario_id", "annee", "kpi", "valeur"])
+    else:
+        kpi_all = pd.DataFrame(columns=["scenario_id", "annee", "kpi", "valeur"])
+
+    scenarios = sorted(kpi_all["scenario_id"].unique()) if len(kpi_all) else []
+    couleurs = [COUL["bleu"], COUL["vert"], COUL["or"], COUL["rouge"], "#8E44AD", "#16A085"]
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.2))
+    for ax, (kpi_nom, titre, cle_local) in zip(axes, [
+        ("rsi_global_pct", "RSI global (%)", "rsi_global"),
+        ("resultat_net_m", "Résultat net (M$)", "resultat_net"),
+    ]):
+        for s_i, sc in enumerate(scenarios):
+            d = (kpi_all[(kpi_all["scenario_id"] == sc) & (kpi_all["kpi"] == kpi_nom)]
+                 .sort_values("annee"))
+            ax.plot(d["annee"], d["valeur"], marker="o", linewidth=2.3,
+                    color=couleurs[s_i % len(couleurs)], label=sc)
+        ax.plot(ANNEES, res[cle_local], marker="s", linewidth=2, linestyle=":",
+                color="black", label=f"{scenario_id} (courant)")
+        ax.set_title(titre)
+        ax.set_xticks(ANNEES)
+        ax.legend(fontsize=8.5, title="Scénario")
+    fig.tight_layout()
+    afficher_fig(fig)
+
+    if len(kpi_all):
+        recap = (kpi_all[kpi_all["annee"] == 2030]
+                 .pivot_table(index="scenario_id", columns="kpi", values="valeur")
+                 .rename(columns={"resultat_net_m": "Résultat net 2030 (M$)",
+                                  "rsi_global_pct": "RSI 2030 (%)",
+                                  "van_totale_m": "VAN 2030 (M$)",
+                                  "csm_solde_fin_m": "CSM fin 2030 (M$)"})
+                 .round(1).reset_index().rename(columns={"scenario_id": "Scénario"}))
+        st.dataframe(recap, hide_index=True, width="stretch")
+    elif conn_ok:
+        st.info("Aucun scénario écrit pour l'instant : utiliser 💾 dans la barre latérale.")
+
+with ong4:
+    st.markdown(f"**État des résultats IFRS 17 — « {scenario_id} » (M$)**")
+    pnl = pd.DataFrame({
+        "Ligne": ["Produits d'assurance", "Charges d'assurance", "Réassurance nette",
+                  "Résultats des activités d'assurance", "Résultat financier",
+                  "Résultats autres", "Résultat d'exploitation", "Impôts", "Résultat net"],
+        **{str(a): np.round([res["produits_ass"][j], -res["charges_ass"][j],
+                             res["reassurance"][j], res["activites"][j],
+                             res["interet_marche"][j], res["depenses"][j],
+                             res["exploitation"][j], -res["impots"][j],
+                             res["resultat_net"][j]], 1)
+           for j, a in enumerate(ANNEES)},
+    })
+    st.dataframe(pnl, hide_index=True, width="stretch")
+
+    st.markdown("**Ventes par produit (K$)**")
+    ventes_df = pd.DataFrame(res["ventes_scen"].round(0), index=PRODUITS,
+                             columns=[str(a) for a in ANNEES]).reset_index(names="Produit")
+    st.dataframe(ventes_df, hide_index=True, width="stretch")
+
+    st.download_button(
+        "⬇️ Télécharger le P&L (CSV)",
+        pnl.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
+        file_name=f"pnl_{scenario_id}.csv", mime="text/csv",
+    )
+
+st.caption("Baseline immuable + overlay de leviers → recalcul du Gold par scénario · "
+           f"Schéma Unity Catalog : `{CATALOG}.{SCHEMA}` · Données synthétiques.")
