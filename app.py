@@ -42,23 +42,23 @@ N = len(ANNEES)
 PRODUITS = [
     "Vie entière avec participation", "Vie entière à paiements limités",
     "Autres vies entières", "Temporaires", "Maladies graves",
-    "Autres invalidité et maladie", "Option dépôt supplémentaire (ODS)", "Autres",
+    "Autres invalidité et maladie",
 ]
 CANAUX = ["Indépendants", "Desjardins", "Agents Desjardins"]
 
-VENTES_2025 = np.array([39510, 5400, 8660, 24723, 20940, 4300, 500, 2500], dtype=float)
-VENTES_2030 = np.array([68674, 8520, 13970, 35680, 32020, 6330, 1266, 3540], dtype=float)
-JALONS_TOTAUX = np.array([106533, 116700, 129000, 142000, 155500, 170000], dtype=float)
+# 6 familles (ODS et « Autres » retirées du périmètre à la demande du métier)
+VENTES_2025 = np.array([39510, 5400, 8660, 24723, 20940, 4300], dtype=float)
+VENTES_2030 = np.array([68674, 8520, 13970, 35680, 32020, 6330], dtype=float)
 
 RSI_MATRICE = pd.DataFrame(
     {
-        "Indépendants":      [5.6, 1.8, 9.2, 7.3, 17.1, np.nan, np.nan, np.nan],
-        "Desjardins":        [3.1, 16.7, 55.6, 6.9, 5.2, np.nan, np.nan, np.nan],
-        "Agents Desjardins": [np.nan, 1.4, -1.2, -10.5, -0.6, -5.3, np.nan, np.nan],
+        "Indépendants":      [5.6, 1.8, 9.2, 7.3, 17.1, np.nan],
+        "Desjardins":        [3.1, 16.7, 55.6, 6.9, 5.2, np.nan],
+        "Agents Desjardins": [np.nan, 1.4, -1.2, -10.5, -0.6, -5.3],
     },
     index=PRODUITS,
 )
-VAN_2025 = np.array([-12848, 3005, 900, 1177, 748, -2024, 0, 0], dtype=float)
+VAN_2025 = np.array([-12848, 3005, 900, 1177, 748, -2024], dtype=float)
 MARGE_VAN = VAN_2025 / VENTES_2025
 
 BASE_COUTS = np.array([95.0, 48.0, 14.6])         # acquisition / attribuables / non attr. (M$)
@@ -87,6 +87,8 @@ def fmt_pct(x, dec=1):
 # ==============================================================================
 @st.cache_data(show_spinner=False)
 def ventes_baseline():
+    """Interpolation géométrique 2025->2030 par famille + léger bruit (seed 42).
+    Périmètre 6 familles : total 2025 ≈ 103,5 M$, 2030 ≈ 165,2 M$ (~9,8 %/an)."""
     rng = np.random.default_rng(42)
     tx = (VENTES_2030 / VENTES_2025) ** (1 / (N - 1))
     v = np.array([VENTES_2025 * tx**t for t in range(N)]).T
@@ -94,7 +96,6 @@ def ventes_baseline():
     bruit[:, 0] = 1.0
     bruit[:, -1] = 1.0
     v *= bruit
-    v *= JALONS_TOTAUX / v.sum(axis=0)
     return v
 
 VENTES_BASE = ventes_baseline()
@@ -102,23 +103,17 @@ VENTES_BASE = ventes_baseline()
 # ==============================================================================
 # 3. MOTEUR DE CALCUL (copie conforme du notebook Phase 1)
 # ==============================================================================
-def calculer_scenario(scenario_id, fact_volume, accent_mix, parts_canal,
+def calculer_scenario(scenario_id, fact_volume, croiss_fam, parts_canal,
                       rendement, g_acq, g_attr, g_na):
+    """croiss_fam : ajustement de croissance PAR FAMILLE, en points de %/an vs le plan
+    (ex. +2.0 -> la famille croît 2 pts plus vite chaque année que sa trajectoire de base)."""
     t_idx = np.arange(N)
     rsi_mat = RSI_MATRICE.to_numpy()
-    poids_canal_base = np.array([0.60, 0.25, 0.15])
-    with np.errstate(invalid="ignore"):
-        denom = np.nansum(~np.isnan(rsi_mat) * poids_canal_base, axis=1)
-        score = np.nansum(np.where(np.isnan(rsi_mat), 0, rsi_mat) * poids_canal_base, axis=1) / \
-                np.where(denom == 0, 1, denom)
-    score_c = (score - score.mean()) / 10.0
 
-    ventes_scen = np.zeros_like(VENTES_BASE)
-    for j in range(N):
-        w = VENTES_BASE[:, j] / VENTES_BASE[:, j].sum()
-        w_adj = np.clip(w * (1 + accent_mix * score_c), 1e-6, None)
-        w_adj = w_adj / w_adj.sum()
-        ventes_scen[:, j] = VENTES_BASE[:, j].sum() * fact_volume * w_adj
+    # Levier B : chaque famille suit sa trajectoire de base × (1 + ajustement)^t
+    adj = np.array(croiss_fam, dtype=float) / 100.0            # points -> fraction
+    facteur_fam = (1.0 + adj[:, None]) ** t_idx[None, :]        # (familles x années)
+    ventes_scen = VENTES_BASE * fact_volume * facteur_fam
 
     ventes_tot_m = ventes_scen.sum(axis=0) / 1000.0
     ventes_pc = ventes_scen[:, :, None] * np.array(parts_canal)[None, None, :]
@@ -194,8 +189,9 @@ def calculer_scenario(scenario_id, fact_volume, accent_mix, parts_canal,
         "reassurance": reassurance, "impots": impots, "activites": activites,
     }
 
-PARAMS_BASE = dict(fact_volume=1.0, accent_mix=0.0, parts_canal=[0.60, 0.25, 0.15],
-                   rendement=0.035, g_acq=0.035, g_attr=0.030, g_na=0.020)
+PARAMS_BASE = dict(fact_volume=1.0, croiss_fam=[0.0] * len(PRODUITS),
+                   parts_canal=[0.60, 0.25, 0.15], rendement=0.035,
+                   g_acq=0.035, g_attr=0.030, g_na=0.020)
 
 @st.cache_data(show_spinner=False)
 def resultat_baseline():
@@ -284,7 +280,6 @@ def construire_lignes(res, params, scenario_id):
 
     overlay = [
         (scenario_id, "A_facteur_volume", params["fact_volume"], 1.00, horo),
-        (scenario_id, "B_accent_croissance_mix", params["accent_mix"], 0.00, horo),
         (scenario_id, "C_part_independants", pc[0], 0.60, horo),
         (scenario_id, "C_part_desjardins", pc[1], 0.25, horo),
         (scenario_id, "C_part_agents", pc[2], 0.15, horo),
@@ -292,6 +287,9 @@ def construire_lignes(res, params, scenario_id):
         (scenario_id, "E_croiss_couts_acquisition", params["g_acq"], 0.035, horo),
         (scenario_id, "E_croiss_couts_attribuables", params["g_attr"], 0.030, horo),
         (scenario_id, "E_croiss_couts_non_attrib", params["g_na"], 0.020, horo),
+    ] + [
+        (scenario_id, f"B_croiss_{p}", float(params["croiss_fam"][i]), 0.00, horo)
+        for i, p in enumerate(PRODUITS)
     ]
 
     sections = {
@@ -363,7 +361,9 @@ def construire_lignes(res, params, scenario_id):
                     kpi.append((scenario_id, a, "produit_canal", p, c, "rsi_pct",
                                 round(float(res["rsi_adj"][i, c_i]), 2), "%"))
 
-    dim = [(scenario_id, horo, params["fact_volume"], params["accent_mix"],
+    # accent_croissance (ancien levier B) omis -> NULL ; les leviers B par famille
+    # vivent désormais dans overlay_drivers_slv (format long, flexible).
+    dim = [(scenario_id, horo, params["fact_volume"],
             pc[0], pc[1], pc[2], params["rendement"], params["g_acq"],
             params["g_attr"], params["g_na"])]
     return overlay, forecast, kpi, dim
@@ -385,7 +385,7 @@ def ecrire_scenario(res, params, scenario_id, catalog, schema):
         ("kpi_gld",
          ["scenario_id", "annee", "niveau", "produit", "canal", "kpi", "valeur", "unite"], kpi),
         ("dim_scenario_gld",
-         ["scenario_id", "horodatage", "facteur_volume", "accent_croissance",
+         ["scenario_id", "horodatage", "facteur_volume",
           "part_independants", "part_desjardins", "part_agents", "rendement_placement",
           "croiss_couts_acquisition", "croiss_couts_attribuables",
           "croiss_couts_non_attribuables"], dim),
@@ -444,9 +444,7 @@ def fig_heatmap(rsi_adj, rendement, scenario_id):
     cmap.set_bad(color="#E8E8E4")
     im = ax.imshow(donnees, cmap=cmap, vmin=-12, vmax=20, aspect="auto")
     ax.set_xticks(range(len(CANAUX)), CANAUX, fontsize=10.5)
-    ax.set_yticks(range(len(PRODUITS)),
-                  [p.replace("Option dépôt supplémentaire (ODS)", "ODS") for p in PRODUITS],
-                  fontsize=9.5)
+    ax.set_yticks(range(len(PRODUITS)), PRODUITS, fontsize=9.5)
     for i in range(len(PRODUITS)):
         for j in range(len(CANAUX)):
             v = rsi_adj[i, j]
@@ -496,30 +494,51 @@ st.title("📊 Plan financier simplifié par leviers — Assurance individuelle"
 st.caption("⚠️ **Données synthétiques à des fins de démonstration** · IFRS 17 · "
            "2025 (estimé) → 2030 · POC Databricks App")
 
+# ---- Clés des widgets (permettent le rechargement d'un scénario écrit) ---------
+FAMILLES_COURTES = ["VE participation", "VE paiements limités", "Autres VE",
+                    "Temporaires", "Maladies graves", "Autres inv. et maladie"]
+CLES_B = [f"k_b_{i}" for i in range(len(PRODUITS))]
+CLES_DEFAUTS = {"k_scen": "Base", "k_vol": 1.00, "k_ind": 60, "k_dsj": 25, "k_agt": 15,
+                "k_rdt": 3.50, "k_gacq": 3.5, "k_gattr": 3.0, "k_gna": 2.0,
+                **{c: 0.0 for c in CLES_B}}
+for cle, defaut in CLES_DEFAUTS.items():
+    st.session_state.setdefault(cle, defaut)
+
+# Application d'un scénario à recharger (préparé au clic du bouton 📂, voir plus bas)
+if "_a_charger" in st.session_state:
+    for cle, valeur in st.session_state.pop("_a_charger").items():
+        st.session_state[cle] = valeur
+
 # ---- Barre latérale : leviers ------------------------------------------------
 st.sidebar.header("🎛️ Leviers du scénario")
-scenario_id = st.sidebar.text_input("Nom du scénario", "Base",
+scenario_id = st.sidebar.text_input("Nom du scénario", key="k_scen",
                                     help="Clé du write-back : « Base » = baseline.").strip() or "Base"
 
-fact_volume = st.sidebar.slider("A — Volume de ventes global (×)", 0.80, 1.30, 1.00, 0.01)
-accent_mix = st.sidebar.slider("B — Accent mix produits (→ meilleur RSI)", -1.0, 1.0, 0.0, 0.05)
+fact_volume = st.sidebar.slider("A — Volume de ventes global (×)", 0.80, 1.30,
+                                step=0.01, key="k_vol")
+
+with st.sidebar.expander("B — Croissance par famille (pts de %/an vs plan)", expanded=False):
+    st.caption("0 = trajectoire du plan ; +2 = la famille croît 2 pts plus vite chaque année.")
+    croiss_fam = [st.slider(FAMILLES_COURTES[i], -10.0, 10.0, step=0.5, key=CLES_B[i])
+                  for i in range(len(PRODUITS))]
 
 with st.sidebar.expander("C — Mix canal (%)", expanded=False):
-    p_ind = st.slider("Indépendants", 0, 100, 60, 1)
-    p_dsj = st.slider("Desjardins", 0, 100, 25, 1)
-    p_agt = st.slider("Agents Desjardins", 0, 100, 15, 1)
+    p_ind = st.slider("Indépendants", 0, 100, step=1, key="k_ind")
+    p_dsj = st.slider("Desjardins", 0, 100, step=1, key="k_dsj")
+    p_agt = st.slider("Agents Desjardins", 0, 100, step=1, key="k_agt")
     total_c = max(1, p_ind + p_dsj + p_agt)
     parts_canal = [p_ind / total_c, p_dsj / total_c, p_agt / total_c]
     st.caption("Renormalisé : " + " / ".join(f"{p*100:.0f} %" for p in parts_canal))
 
-rendement = st.sidebar.slider("D — Rendement de placement (%)", 2.50, 5.00, 3.50, 0.05) / 100.0
+rendement = st.sidebar.slider("D — Rendement de placement (%)", 2.50, 5.00,
+                              step=0.05, key="k_rdt") / 100.0
 
 with st.sidebar.expander("E — Croissance des dépenses (%/an)", expanded=False):
-    g_acq = st.slider("Coûts d'acquisition", 0.0, 8.0, 3.5, 0.1) / 100.0
-    g_attr = st.slider("Coûts attribuables", 0.0, 8.0, 3.0, 0.1) / 100.0
-    g_na = st.slider("Coûts non attribuables", 0.0, 8.0, 2.0, 0.1) / 100.0
+    g_acq = st.slider("Coûts d'acquisition", 0.0, 8.0, step=0.1, key="k_gacq") / 100.0
+    g_attr = st.slider("Coûts attribuables", 0.0, 8.0, step=0.1, key="k_gattr") / 100.0
+    g_na = st.slider("Coûts non attribuables", 0.0, 8.0, step=0.1, key="k_gna") / 100.0
 
-params = dict(fact_volume=float(fact_volume), accent_mix=float(accent_mix),
+params = dict(fact_volume=float(fact_volume), croiss_fam=[float(c) for c in croiss_fam],
               parts_canal=[float(p) for p in parts_canal], rendement=float(rendement),
               g_acq=float(g_acq), g_attr=float(g_attr), g_na=float(g_na))
 
@@ -539,6 +558,45 @@ with st.sidebar.expander("⚙️ Avancé (catalog / schéma)"):
 
 st.sidebar.divider()
 if conn_ok:
+    # ---- 📂 Recharger un scénario déjà écrit dans les curseurs -------------------
+    try:
+        scen_dispo = requete(
+            f"SELECT DISTINCT scenario_id FROM {qualifier('dim_scenario_gld', CATALOG, SCHEMA)} "
+            f"ORDER BY scenario_id")["scenario_id"].tolist()
+    except Exception:
+        scen_dispo = []
+    if scen_dispo:
+        with st.sidebar.expander("📂 Recharger un scénario écrit", expanded=False):
+            choix = st.selectbox("Scénario", scen_dispo, key="k_choix_chargement")
+            if st.button("Charger dans les curseurs", width="stretch"):
+                try:
+                    ov = requete(
+                        f"SELECT levier, valeur FROM "
+                        f"{qualifier('overlay_drivers_slv', CATALOG, SCHEMA)} "
+                        f"WHERE scenario_id = '{esc(choix)}'")
+                    lev = dict(zip(ov["levier"], ov["valeur"].astype(float)))
+                    total = (lev.get("C_part_independants", 0.60)
+                             + lev.get("C_part_desjardins", 0.25)
+                             + lev.get("C_part_agents", 0.15)) or 1.0
+                    charge = {
+                        "k_scen": choix,
+                        "k_vol": round(float(lev.get("A_facteur_volume", 1.0)), 2),
+                        "k_ind": int(round(lev.get("C_part_independants", 0.60) / total * 100)),
+                        "k_dsj": int(round(lev.get("C_part_desjardins", 0.25) / total * 100)),
+                        "k_agt": int(round(lev.get("C_part_agents", 0.15) / total * 100)),
+                        "k_rdt": round(lev.get("D_rendement_placement", 0.035) * 100, 2),
+                        "k_gacq": round(lev.get("E_croiss_couts_acquisition", 0.035) * 100, 1),
+                        "k_gattr": round(lev.get("E_croiss_couts_attribuables", 0.030) * 100, 1),
+                        "k_gna": round(lev.get("E_croiss_couts_non_attrib", 0.020) * 100, 1),
+                    }
+                    for i, p in enumerate(PRODUITS):   # levier B par famille (0 si absent
+                        charge[CLES_B[i]] = round(     # -> scénario écrit avant la refonte B)
+                            float(lev.get(f"B_croiss_{p}", 0.0)), 1)
+                    st.session_state["_a_charger"] = charge
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Chargement impossible : {e}")
+
     if st.sidebar.button("💾 Écrire le scénario dans Delta", type="primary",
                          width="stretch"):
         try:
