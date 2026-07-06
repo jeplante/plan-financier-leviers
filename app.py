@@ -46,9 +46,15 @@ PRODUITS = [
 ]
 CANAUX = ["Indépendants", "Desjardins", "Agents Desjardins"]
 
+# ---- Facteur d'échelle de camouflage -----------------------------------------
+# Tous les NIVEAUX monétaires (ventes, P&L, CSM, capital, coûts, polices) sont
+# multipliés par ECHELLE pour s'éloigner de tout ordre de grandeur réel.
+# Les RATIOS (RSI, marges, coût par police) restent cohérents entre eux.
+ECHELLE = 2.0
+
 # 6 familles (ODS et « Autres » retirées du périmètre à la demande du métier)
-VENTES_2025 = np.array([39510, 5400, 8660, 24723, 20940, 4300], dtype=float)
-VENTES_2030 = np.array([68674, 8520, 13970, 35680, 32020, 6330], dtype=float)
+VENTES_2025 = np.array([39510, 5400, 8660, 24723, 20940, 4300], dtype=float) * ECHELLE
+VENTES_2030 = np.array([68674, 8520, 13970, 35680, 32020, 6330], dtype=float) * ECHELLE
 
 RSI_MATRICE = pd.DataFrame(
     {
@@ -58,11 +64,13 @@ RSI_MATRICE = pd.DataFrame(
     },
     index=PRODUITS,
 )
-VAN_2025 = np.array([-12848, 3005, 900, 1177, 748, -2024], dtype=float)
+VAN_2025 = np.array([-12848, 3005, 900, 1177, 748, -2024], dtype=float) * ECHELLE
 MARGE_VAN = VAN_2025 / VENTES_2025
 
-BASE_COUTS = np.array([95.0, 48.0, 14.6])         # acquisition / attribuables / non attr. (M$)
-POLICES_2025, POLICES_2030 = 52083.0, 72000.0
+BASE_COUTS = np.array([95.0, 48.0, 14.6]) * ECHELLE   # acquisition / attribuables / non attr. (M$)
+# Échelle distincte pour les polices -> le coût unitaire par police est lui aussi
+# décalé des valeurs d'origine (≈ 4 034 $ -> 3 381 $ au lieu de 3 026 -> 2 536 $).
+POLICES_2025, POLICES_2030 = 52083.0 * 1.5, 72000.0 * 1.5
 
 COUL = {"vert": "#00874E", "rouge": "#C0392B", "bleu": "#1F5673",
         "gris": "#7F8C8D", "or": "#B8860B", "fond": "#F7F7F5"}
@@ -130,11 +138,12 @@ def calculer_scenario(scenario_id, fact_volume, croiss_fam, parts_canal,
     van_tot_m = van_k.sum(axis=0) / 1000.0
 
     marge_csm = np.linspace(0.75, 1.03, N)
-    nb_csm = marge_csm * ventes_tot_m
-    chg_hyp = np.array([-37, -25, -12, 0, 10, 20], dtype=float)
-    exp_csm = 12.0
+    nb_csm = marge_csm * ventes_tot_m                      # ventes déjà à l'échelle
+    # Changements d'hypothèses lissés (plus de choc -37 en 2025 -> trajectoire douce)
+    chg_hyp = np.array([-12, -8, -4, 0, 6, 12], dtype=float) * ECHELLE
+    exp_csm = 12.0 * ECHELLE
     csm_open, csm_close, csm_release, csm_interet = [], [], [], []
-    solde = 1937.0
+    solde = 1937.0 * ECHELLE
     for j in range(N):
         rel = 0.071 * solde
         inte = 0.0315 * solde * (rendement / 0.035)
@@ -145,19 +154,21 @@ def calculer_scenario(scenario_id, fact_volume, croiss_fam, parts_canal,
     csm_open, csm_close = np.array(csm_open), np.array(csm_close)
     csm_release, csm_interet = np.array(csm_release), np.array(csm_interet)
 
-    ra_release = 31.0 * 1.05 ** t_idx
+    ra_release = 31.0 * ECHELLE * 1.05 ** t_idx
     profit_attendu = csm_release + ra_release
     impact_ventes = 0.11 * van_tot_m
-    experience = 15.0 + 1.5 * t_idx
+    experience = (15.0 + 1.5 * t_idx) * ECHELLE
 
     acq = BASE_COUTS[0] * (1 + g_acq) ** t_idx
     attr = BASE_COUTS[1] * (1 + g_attr) ** t_idx
     na = BASE_COUTS[2] * (1 + g_na) ** t_idx
     depenses_src = -(attr + na + 0.30 * acq)
 
-    capital = np.linspace(464.0, 581.0, N) * (0.85 + 0.15 * fact_volume)
+    capital = np.linspace(464.0, 581.0, N) * ECHELLE * (0.85 + 0.15 * fact_volume)
     actifs = capital * 5.6
-    accretion_passifs = np.array([0.0, 26.0, 34.0, 41.0, 45.0, 49.0])
+    # Accrétion des passifs LINÉAIRE : plus de « boom » 2025 -> trajectoire lisse,
+    # calibrée pour un RSI ~25 % qui glisse doucement vers ~22 %.
+    accretion_passifs = np.linspace(30.0, 49.0, N) * ECHELLE
     interet_marche = actifs * rendement - accretion_passifs
 
     activites = profit_attendu + impact_ventes + experience
@@ -166,8 +177,8 @@ def calculer_scenario(scenario_id, fact_volume, croiss_fam, parts_canal,
     resultat_net = exploitation - impots
 
     echelle_vol = 0.85 + 0.15 * fact_volume
-    produits_ass = np.linspace(669.0, 806.0, N) * echelle_vol
-    charges_ass = np.linspace(450.0, 561.0, N) * echelle_vol
+    produits_ass = np.linspace(669.0, 806.0, N) * ECHELLE * echelle_vol
+    charges_ass = np.linspace(450.0, 561.0, N) * ECHELLE * echelle_vol
     reassurance = activites - (produits_ass - charges_ass)
     rsi_global = resultat_net / capital * 100.0
 
@@ -494,6 +505,33 @@ st.title("📊 Plan financier simplifié par leviers — Assurance individuelle"
 st.caption("⚠️ **Données synthétiques à des fins de démonstration** · IFRS 17 · "
            "2025 (estimé) → 2030 · POC Databricks App")
 
+# ---- 🧭 Démarche (storyline mise en évidence, façon SUMMARY/STORYLINE) ----------
+_etapes = ["1️⃣ Ventes d'affaires nouvelles", "2️⃣ CSM des ventes + VAN",
+           "3️⃣ État des résultats IFRS 17", "4️⃣ Capital à rémunérer",
+           "5️⃣ RSI (ROE)", "6️⃣ Sources de bénéfices", "7️⃣ Roll-forward CSM",
+           "🎛️ Leviers → recalcul"]
+st.markdown(
+    "<div style='background:#EAF3EE;border-left:6px solid #00874E;border-radius:6px;"
+    "padding:10px 14px;margin-bottom:6px;'>"
+    "<b>🧭 Démarche</b> &nbsp;·&nbsp; " +
+    " <span style='color:#00874E;font-weight:bold'>→</span> ".join(
+        f"<span style='white-space:nowrap'>{e}</span>" for e in _etapes) +
+    "</div>",
+    unsafe_allow_html=True,
+)
+with st.expander("Voir le détail de la démarche (passifs / actifs / consolidé)"):
+    st.markdown("""
+| Bloc | Approche | Outil |
+|---|---|---|
+| **Passifs — In-force** | Baseline synthétique du bloc en vigueur (relâche CSM + RA, expérience), agrégée au niveau des 6 familles de produits | Delta (médaillon) |
+| **Passifs — Affaires nouvelles** | Ventes par famille × canal → marge CSM et VAN@12 % ; leviers de volume (A), de croissance par famille (B) et de mix canal (C) en overlay | Moteur pandas |
+| **Combiné (In-force + AN)** | Alimente sans couture l'état des résultats IFRS 17 et le roll-forward du CSM | Moteur pandas |
+| **Actifs** | Résultat financier ≈ actifs investis × rendement (levier D) − accrétion des passifs | Moteur pandas |
+| **Consolidé** | Capital à rémunérer → RSI (ROE), sources de bénéfices, coûts unitaires (levier E) ; write-back par scénario dans le Gold | Delta + app |
+
+**Principe clé : baseline immuable + overlay de leviers → recalcul du Gold par scénario.**
+""")
+
 # ---- Clés des widgets (permettent le rechargement d'un scénario écrit) ---------
 FAMILLES_COURTES = ["VE participation", "VE paiements limités", "Autres VE",
                     "Temporaires", "Maladies graves", "Autres inv. et maladie"]
@@ -613,6 +651,65 @@ else:
                        "déjà écrits. Vérifier la ressource `sql_warehouse` de l'app et les "
                        "droits du principal de service sur le schéma.")
 
+def generer_faits_saillants(res, res_base, params, jf, annee_focus, scenario_id):
+    """Faits saillants générés automatiquement à partir des résultats (règles métier).
+    Alternative légère et 100 % fiable en démo à un Genie embarqué."""
+    faits = []
+
+    # 1) Écart vs Base + levier dominant
+    d_net = res["resultat_net"][jf] - res_base["resultat_net"][jf]
+    ecarts_lev = {
+        "le volume (A)": abs(params["fact_volume"] - 1.0) / 0.10,
+        "la croissance par famille (B)": max(abs(c) for c in params["croiss_fam"]) / 2.0,
+        "le mix canal (C)": max(abs(params["parts_canal"][0] - 0.60),
+                                abs(params["parts_canal"][1] - 0.25),
+                                abs(params["parts_canal"][2] - 0.15)) / 0.05,
+        "le rendement de placement (D)": abs(params["rendement"] - 0.035) / 0.0025,
+        "les dépenses (E)": max(abs(params["g_acq"] - 0.035), abs(params["g_attr"] - 0.030),
+                                abs(params["g_na"] - 0.020)) / 0.005,
+    }
+    levier_dom = max(ecarts_lev, key=ecarts_lev.get)
+    if max(ecarts_lev.values()) < 0.01:
+        faits.append(f"⚖️ Le scénario « {scenario_id} » est aligné sur la baseline : "
+                     f"aucun levier n'a été bougé.")
+    else:
+        sens = "au-dessus" if d_net >= 0 else "en dessous"
+        faits.append(f"⚖️ Résultat net {annee_focus} : **{fmt_m(abs(d_net))} {sens} de la "
+                     f"baseline** ; principal levier actionné : **{levier_dom}**.")
+
+    # 2) Meilleure et pire cellule RSI produit × canal
+    rsi = res["rsi_adj"]
+    i_max = np.unravel_index(np.nanargmax(rsi), rsi.shape)
+    i_min = np.unravel_index(np.nanargmin(rsi), rsi.shape)
+    faits.append(f"🏆 Meilleur RSI des ventes : **{PRODUITS[i_max[0]]} × {CANAUX[i_max[1]]}** "
+                 f"à **{fmt_pct(rsi[i_max])}** ; le plus faible : "
+                 f"{PRODUITS[i_min[0]]} × {CANAUX[i_min[1]]} à {fmt_pct(rsi[i_min])}.")
+
+    # 3) Produits destructeurs de valeur (VAN négative, année focus)
+    van_focus = res["van_k"][:, jf] / 1000.0
+    negatifs = [(PRODUITS[i], van_focus[i]) for i in range(len(PRODUITS)) if van_focus[i] < -0.5]
+    if negatifs:
+        pire = min(negatifs, key=lambda x: x[1])
+        faits.append(f"🔻 {len(negatifs)} famille(s) détruisent de la valeur en {annee_focus} "
+                     f"(VAN totale {fmt_m(res['van_tot_m'][jf], 1)}) ; la plus déficitaire : "
+                     f"**{pire[0]}** à {fmt_m(pire[1], 1)}.")
+    else:
+        faits.append(f"🟢 Aucune famille ne détruit de valeur en {annee_focus} — "
+                     f"VAN totale : {fmt_m(res['van_tot_m'][jf], 1)}.")
+
+    # 4) Trajectoire CSM et coûts unitaires sur l'horizon
+    d_csm = res["csm_close"][-1] - res["csm_open"][0]
+    faits.append(f"📈 Le solde CSM passe de {fmt_m(res['csm_open'][0])} à "
+                 f"**{fmt_m(res['csm_close'][-1])}** sur l'horizon "
+                 f"({'+' if d_csm >= 0 else ''}{fmt_fr(d_csm / res['csm_open'][0] * 100, 1)} %).")
+    d_cpp = res["cout_par_police"][-1] - res["cout_par_police"][0]
+    tendance = "baisse" if d_cpp < 0 else "hausse"
+    faits.append(f"💰 Coût d'acquisition moyen par police en **{tendance}** : "
+                 f"{fmt_fr(res['cout_par_police'][0])} $ → "
+                 f"{fmt_fr(res['cout_par_police'][-1])} $ "
+                 f"(effet volume vs croissance des dépenses).")
+    return faits
+
 # ---- Cartes KPI (avec écart vs Base) --------------------------------------------
 annee_focus = st.select_slider("Année mise en vedette", options=ANNEES, value=2030)
 jf = ANNEES.index(annee_focus)
@@ -626,6 +723,13 @@ c3.metric("VAN des affaires nouvelles", fmt_m(res["van_tot_m"][jf], 1),
           delta=fmt_m(res["van_tot_m"][jf] - res_base["van_tot_m"][jf], 1) + " vs Base")
 c4.metric("Solde CSM (fin)", fmt_m(res["csm_close"][jf]),
           delta=fmt_m(res["csm_close"][jf] - res_base["csm_close"][jf]) + " vs Base")
+
+# ---- 💡 Faits saillants automatisés ----------------------------------------------
+with st.container(border=True):
+    st.markdown(f"**💡 Faits saillants — « {scenario_id} » · {annee_focus}** "
+                f"*(générés automatiquement à partir du scénario courant)*")
+    for fait in generer_faits_saillants(res, res_base, params, jf, annee_focus, scenario_id):
+        st.markdown(f"- {fait}")
 
 # ---- Onglets ---------------------------------------------------------------------
 ong1, ong2, ong3, ong4 = st.tabs(
