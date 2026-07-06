@@ -45,7 +45,7 @@ from moteur_plan import (
     calculer_scenario, PARAMS_BASE, construire_lignes, generer_faits_saillants,
     COUSSINS, POIDS_COUSSINS, CATEGORIES_COUTS, ALLOC_BLOCS_VERS_CATEGORIES,
     BLOCS_COUTS, CLASSES_ACTIFS, POIDS_ACTIFS, RDT_CLASSES_DEFAUT,
-    rendement_pondere, ORACLE_MAPPING,
+    rendement_pondere, ORACLE_MAPPING, MOIS, PROFILS_MENSUELS, mensualiser,
 )
 
 plt.rcParams.update({
@@ -265,6 +265,11 @@ div[data-testid="stMetric"]{background:#FFFFFF;border:1px solid #E8E8E4;
   border-radius:12px;padding:14px 18px;box-shadow:0 1px 3px rgba(0,0,0,.05);}
 div[data-testid="stMetric"] label{color:#7F8C8D;}
 div[data-testid="stVerticalBlockBorderWrapper"]{border-radius:12px;}
+button[data-baseweb="tab"]{border-radius:10px 10px 0 0;padding:8px 14px;}
+button[data-baseweb="tab"][aria-selected="true"]{background:#EAF3EE;
+  border-bottom:3px solid #00874E;font-weight:600;}
+div[role="radiogroup"] label{background:#FFFFFF;border:1px solid #E8E8E4;
+  border-radius:8px;padding:4px 12px;margin-right:6px;}
 </style>""", unsafe_allow_html=True)
 
 st.title("📊 Plan financier simplifié par leviers — Assurance individuelle")
@@ -445,6 +450,20 @@ c3.metric("VAN des affaires nouvelles", fmt_m(res["van_tot_m"][jf], 1),
 c4.metric("Solde CSM (fin)", fmt_m(res["csm_close"][jf]),
           delta=fmt_m(res["csm_close"][jf] - res_base["csm_close"][jf]) + " vs Base")
 
+# ---- Sparklines sous les cartes (tendance 2025-2030) ------------------------------
+fig, axes = plt.subplots(1, 4, figsize=(15, 0.9))
+fig.patch.set_alpha(0)
+for ax, (serie, couleur) in zip(axes, [
+    (res["resultat_net"], COUL["vert"]), (res["rsi_global"], COUL["bleu"]),
+    (res["van_tot_m"], COUL["rouge"]), (res["csm_close"], COUL["or"]),
+]):
+    ax.plot(ANNEES, serie, color=couleur, linewidth=1.8)
+    ax.fill_between(ANNEES, serie, serie.min(), color=couleur, alpha=0.12)
+    ax.scatter([ANNEES[jf]], [serie[jf]], color=couleur, s=22, zorder=3)
+    ax.axis("off")
+fig.tight_layout(pad=0.2)
+afficher_fig(fig)
+
 # ---- 💡 Faits saillants automatisés ----------------------------------------------
 with st.container(border=True):
     st.markdown(f"**💡 Faits saillants — « {scenario_id} » · {annee_focus}** "
@@ -453,9 +472,9 @@ with st.container(border=True):
         st.markdown(f"- {fait}")
 
 # ---- Onglets ---------------------------------------------------------------------
-ong1, ong_cap, ong_cout, ong2, ong3, ong4 = st.tabs(
-    ["📊 Tableau de bord", "🏛️ Capital", "💸 Coûts",
-     "🔁 Roll-forward CSM", "⚖️ Comparaison", "📄 Détail"]
+ong1, ong_cap, ong_cout, ong2, ong_mois, ong3, ong4 = st.tabs(
+    ["📊 Tableau de bord", "🏛️ Capital", "💸 Coûts", "🔁 Roll-forward CSM",
+     "📅 Mensualisation", "⚖️ Comparaison", "📄 Détail"]
 )
 
 def valeurs_vue(series_list, jf, cumulatif):
@@ -583,7 +602,78 @@ with ong2:
         "Solde fin (M$)": res["csm_close"].round(0),
     }), hide_index=True, width="stretch")
 
+with ong_mois:
+    st.markdown(f"**Mensualisation exploratoire — « {scenario_id} »** "
+                "*(profils de saisonnalité : hypothèses ajustables ; non persisté au Gold)*")
+    c_sel1, c_sel2, c_sel3, c_sel4 = st.columns([1, 1.6, 1.6, 1.2])
+    annee_m = c_sel1.selectbox("Année", ANNEES, index=len(ANNEES) - 1, key="k_m_annee")
+    jm = ANNEES.index(annee_m)
+    series_m = {
+        "Ventes totales (K$)": (res["ventes_scen"].sum(axis=0),
+                                "Saisonnalité ventes (REER + automne)", 0),
+        "Résultat d'exploitation (M$)": (res["exploitation"],
+                                         "Saisonnalité ventes (REER + automne)", 1),
+        "Résultat net (M$)": (res["resultat_net"],
+                              "Saisonnalité ventes (REER + automne)", 1),
+        "Coûts totaux (M$)": (res["couts_blocs"].sum(axis=0),
+                              "Charge de fin d'année (coûts)", 1),
+    }
+    choix_m = c_sel2.selectbox("Ligne à mensualiser", list(series_m.keys()), key="k_m_serie")
+    serie_ann, profil_defaut, dec_m = series_m[choix_m]
+    profil_m = c_sel3.selectbox("Profil de saisonnalité", list(PROFILS_MENSUELS.keys()),
+                                index=list(PROFILS_MENSUELS.keys()).index(profil_defaut),
+                                key="k_m_profil")
+    intensite = c_sel4.slider("Intensité du profil", 0.0, 1.0, 1.0, 0.05, key="k_m_int")
+
+    mens = mensualiser(serie_ann[jm], profil_m, intensite)
+    cum = np.cumsum(mens)
+
+    # Panneau sombre à barres vertes + ligne de cumul (inspiré du visuel fourni)
+    fig, ax = plt.subplots(figsize=(12.5, 4.4))
+    fig.patch.set_facecolor("#2B3A4A")
+    ax.set_facecolor("#2B3A4A")
+    ax.bar(range(12), mens, color="#8FD98F", width=0.55, zorder=3,
+           label=f"{choix_m} — mensuel")
+    ax2 = ax.twinx()
+    ax2.plot(range(12), cum, color="#F5B041", marker="o", linewidth=2.2,
+             label="Cumul depuis janvier", zorder=4)
+    for a in (ax, ax2):
+        a.grid(False)
+        for cote in a.spines.values():
+            cote.set_visible(False)
+        a.tick_params(colors="white", labelsize=9.5)
+    ax.set_xticks(range(12), MOIS)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: fmt_fr(x, dec_m)))
+    ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: fmt_fr(x, dec_m)))
+    ax.set_title(f"{choix_m} — {annee_m} · profil « {profil_m} » (intensité "
+                 f"{intensite:.0%}) · scénario « {scenario_id} »",
+                 color="white", fontsize=12.5, fontweight="bold")
+    l1, e1 = ax.get_legend_handles_labels()
+    l2, e2 = ax2.get_legend_handles_labels()
+    ax.legend(l1 + l2, e1 + e2, fontsize=9, facecolor="#2B3A4A",
+              labelcolor="white", edgecolor="#44576B")
+    fig.tight_layout()
+    afficher_fig(fig)
+
+    tbl_m = pd.DataFrame({"Mois": MOIS, choix_m: np.round(mens, dec_m),
+                          "Cumul": np.round(cum, dec_m),
+                          "Poids (%)": np.round(mens / mens.sum() * 100, 1)})
+    cg, cd = st.columns([1.4, 1])
+    cg.dataframe(tbl_m, hide_index=True, width="stretch")
+    with cd:
+        st.metric(f"Total {annee_m}", fmt_fr(float(serie_ann[jm]), dec_m))
+        pointe = int(np.argmax(mens))
+        st.metric("Mois de pointe", MOIS[pointe],
+                  delta=f"{mens[pointe] / mens.sum() * 100:.1f} % de l'année")
+        st.download_button("⬇️ Télécharger (CSV)",
+                           tbl_m.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
+                           file_name=f"mensualisation_{scenario_id}_{annee_m}.csv",
+                           mime="text/csv", key="k_m_dl")
+    st.caption("💡 Prochaine itération possible : persister la vue mensuelle par scénario "
+               "dans une table Gold (`forecast_mensuel_gld`) pour Genie et Power BI.")
+
 with ong3:
+
     st.markdown("**Scénarios écrits dans `kpi_gld`** (notebook Phase 1 ou bouton "
                 "« Écrire le scénario »). Le scénario courant *(non écrit)* est superposé "
                 "en pointillé.")

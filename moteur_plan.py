@@ -89,6 +89,31 @@ def rendement_pondere(rdt_classes_pct):
     """Rendement global = moyenne des rendements par classe pondérée par POIDS_ACTIFS."""
     return float(np.dot(POIDS_ACTIFS, np.asarray(rdt_classes_pct, dtype=float)) / 100.0)
 
+# ---- Mensualisation (profils de saisonnalité, hypothèses de démonstration) ---------
+MOIS = ["Janv", "Févr", "Mars", "Avr", "Mai", "Juin",
+        "Juil", "Août", "Sept", "Oct", "Nov", "Déc"]
+PROFILS_MENSUELS = {
+    "Uniforme": np.full(12, 1 / 12),
+    # Ventes d'assurance individuelle : pointe REER (févr.-mars), creux estival,
+    # remontée d'automne.
+    "Saisonnalité ventes (REER + automne)": np.array(
+        [0.085, 0.105, 0.110, 0.080, 0.075, 0.070,
+         0.060, 0.060, 0.085, 0.090, 0.095, 0.085]),
+    # Coûts : régulier avec charge de fin d'année (régularisations, projets).
+    "Charge de fin d'année (coûts)": np.array(
+        [0.078, 0.078, 0.078, 0.078, 0.078, 0.078,
+         0.078, 0.078, 0.078, 0.078, 0.100, 0.120]),
+}
+
+def mensualiser(valeur_annuelle, profil="Uniforme", intensite=1.0):
+    """Répartit une valeur annuelle sur 12 mois.
+    intensite ∈ [0, 1] : 0 = uniforme, 1 = profil plein ; entre les deux, mélange."""
+    base = PROFILS_MENSUELS["Uniforme"]
+    cible = PROFILS_MENSUELS.get(profil, base)
+    poids = (1.0 - intensite) * base + intensite * cible
+    poids = poids / poids.sum()
+    return float(valeur_annuelle) * poids
+
 # ---- Correspondance dimensions FP -> Oracle EPM -------------------------------------
 ORACLE_MAPPING = pd.DataFrame(
     [
