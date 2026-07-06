@@ -57,6 +57,56 @@ POLICES_2025, POLICES_2030 = 52083.0 * 1.5, 72000.0 * 1.5
 COUL = {"vert": "#00874E", "rouge": "#C0392B", "bleu": "#1F5673",
         "gris": "#7F8C8D", "or": "#B8860B", "fond": "#F7F7F5"}
 
+# ---- Capital requis par catégorie de coussin (HYPOTHÈSES de démonstration) -------
+# Poids appliqués au capital à rémunérer ; la diversification est négative. Somme = 1.
+COUSSINS = ["Assurance", "Crédit et marché", "Opérationnel",
+            "Intérêt", "PfAD", "Diversification"]
+POIDS_COUSSINS = np.array([0.52, 0.30, 0.08, 0.13, 0.17, -0.20])
+
+# ---- Cost module : rétro-allocation vers les catégories AVANT allocation ----------
+CATEGORIES_COUTS = ["Manufacture", "Distribution et appuis à la distribution",
+                    "Opérations", "Réclamations", "Communication et marketing",
+                    "Efficacité opérationnelle", "Autres fonctions de soutien", "TI"]
+# Matrice de rétro-allocation : part de chaque BLOC post-allocation
+# (acquisition / attribuables récurrents / non attribuables) provenant de chaque
+# catégorie avant allocation. Chaque ligne somme à 1,00. Hypothèses de démonstration.
+ALLOC_BLOCS_VERS_CATEGORIES = np.array([
+    #  Manuf  Distr  Opér   Récl   Comm   Effic  Autres TI
+    [0.10, 0.55, 0.05, 0.00, 0.12, 0.02, 0.06, 0.10],   # Coûts d'acquisition
+    [0.08, 0.10, 0.30, 0.20, 0.04, 0.06, 0.10, 0.12],   # Coûts attribuables récurrents
+    [0.05, 0.05, 0.10, 0.05, 0.10, 0.10, 0.35, 0.20],   # Coûts non attribuables
+])
+BLOCS_COUTS = ["Coûts d'acquisition", "Coûts attribuables récurrents",
+               "Coûts non attribuables"]
+
+# ---- Levier D granularisé par classe d'actifs --------------------------------------
+CLASSES_ACTIFS = ["Revenu fixe", "Revenus variables (actions)",
+                  "Immobilier", "Placements alternatifs"]
+POIDS_ACTIFS = np.array([0.70, 0.15, 0.10, 0.05])       # composition du portefeuille
+RDT_CLASSES_DEFAUT = [2.7, 5.5, 4.5, 7.0]               # % ; pondéré ≈ 3,51 %
+
+def rendement_pondere(rdt_classes_pct):
+    """Rendement global = moyenne des rendements par classe pondérée par POIDS_ACTIFS."""
+    return float(np.dot(POIDS_ACTIFS, np.asarray(rdt_classes_pct, dtype=float)) / 100.0)
+
+# ---- Correspondance dimensions FP -> Oracle EPM -------------------------------------
+ORACLE_MAPPING = pd.DataFrame(
+    [
+        ("Produits d'assurance", "AC4100", "Revenus d'assurance"),
+        ("Charges d'assurance", "AC4200", "Charges de services d'assurance"),
+        ("Réassurance nette", "AC4300", "Résultat net de réassurance"),
+        ("Résultats des activités d'assurance", "AC4900", "Sous-total activités d'assurance"),
+        ("Résultat financier", "AC5100", "Produits financiers nets IFRS 17"),
+        ("Résultats autres", "AC5200", "Autres produits et charges"),
+        ("Résultat d'exploitation", "AC5900", "Sous-total exploitation"),
+        ("Impôts", "AC6100", "Charge d'impôt"),
+        ("Résultat net", "AC6900", "Résultat net attribuable"),
+        ("Capital à rémunérer moyen", "KP7100", "Capital économique moyen"),
+        ("Solde CSM fin", "KP7200", "Marge de service contractuelle"),
+    ],
+    columns=["ligne_fp", "compte_oracle", "description_oracle"],
+)
+
 def fmt_fr(x, dec=0, suffixe=""):
     return f"{x:,.{dec}f}".replace(",", " ").replace(".", ",") + suffixe
 
@@ -81,9 +131,11 @@ def ventes_baseline():
 VENTES_BASE = ventes_baseline()
 
 def calculer_scenario(scenario_id, fact_volume, croiss_fam, parts_canal,
-                      rendement, g_acq, g_attr, g_na):
+                      rendement, g_acq, g_attr, g_na, rdt_classes=None):
     """croiss_fam : ajustement de croissance PAR FAMILLE, en points de %/an vs le plan
-    (ex. +2.0 -> la famille croît 2 pts plus vite chaque année que sa trajectoire de base)."""
+    (ex. +2.0 -> la famille croît 2 pts plus vite chaque année que sa trajectoire de base).
+    rdt_classes : rendements par classe d'actifs (%) — informatif ; le calcul utilise
+    `rendement` (déjà pondéré via rendement_pondere), les classes sont tracées en overlay."""
     t_idx = np.arange(N)
     rsi_mat = RSI_MATRICE.to_numpy()
 
@@ -135,6 +187,11 @@ def calculer_scenario(scenario_id, fact_volume, croiss_fam, parts_canal,
 
     capital = np.linspace(464.0, 581.0, N) * ECHELLE * (0.85 + 0.15 * fact_volume)
     actifs = capital * 5.6
+    # Décomposition du capital par catégorie de coussin (poids constants, hypothèse)
+    capital_coussins = POIDS_COUSSINS[:, None] * capital[None, :]        # (6 x années)
+    # Cost module : rétro-allocation des 3 blocs vers les 8 catégories avant allocation
+    couts_blocs = np.vstack([acq, attr, na])                              # (3 x années)
+    couts_avant = ALLOC_BLOCS_VERS_CATEGORIES.T @ couts_blocs             # (8 x années)
     # Accrétion des passifs LINÉAIRE : plus de « boom » 2025 -> trajectoire lisse,
     # calibrée pour un RSI ~25 % qui glisse doucement vers ~22 %.
     accretion_passifs = np.linspace(30.0, 49.0, N) * ECHELLE
@@ -165,12 +222,16 @@ def calculer_scenario(scenario_id, fact_volume, croiss_fam, parts_canal,
         "impact_ventes": impact_ventes, "experience": experience,
         "depenses": depenses_src, "interet_marche": interet_marche,
         "capital": capital, "cout_par_police": cout_par_police, "polices": polices,
+        "capital_coussins": capital_coussins, "couts_avant": couts_avant,
+        "couts_blocs": couts_blocs,
         "produits_ass": produits_ass, "charges_ass": charges_ass,
         "reassurance": reassurance, "impots": impots, "activites": activites,
     }
 
 PARAMS_BASE = dict(fact_volume=1.0, croiss_fam=[0.0] * len(PRODUITS),
-                   parts_canal=[0.60, 0.25, 0.15], rendement=0.035,
+                   parts_canal=[0.60, 0.25, 0.15],
+                   rendement=rendement_pondere(RDT_CLASSES_DEFAUT),   # ≈ 3,51 %
+                   rdt_classes=list(RDT_CLASSES_DEFAUT),
                    g_acq=0.035, g_attr=0.030, g_na=0.020)
 
 def construire_lignes(res, params, scenario_id):
@@ -225,7 +286,19 @@ def construire_lignes(res, params, scenario_id):
             ("Capital à rémunérer moyen", res["capital"]),
             ("Actifs investis (proxy)", res["capital"] * 5.6),
         ],
+        "capital_coussins": [
+            (c, res["capital_coussins"][i]) for i, c in enumerate(COUSSINS)
+        ],
+        "couts_avant_allocation": [
+            (c, res["couts_avant"][i]) for i, c in enumerate(CATEGORIES_COUTS)
+        ],
     }
+    # Levier D granularisé : une ligne d'overlay par classe d'actifs (si fourni)
+    if params.get("rdt_classes"):
+        for i, cl in enumerate(CLASSES_ACTIFS):
+            overlay.append((scenario_id, f"D_rdt_{cl}",
+                            float(params["rdt_classes"][i]) / 100.0,
+                            RDT_CLASSES_DEFAUT[i] / 100.0, horo))
     forecast = []
     for section, lignes_sec in sections.items():
         for ordre, (ligne, serie) in enumerate(lignes_sec, start=1):

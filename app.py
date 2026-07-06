@@ -43,6 +43,9 @@ from moteur_plan import (
     BASE_COUTS, POLICES_2025, POLICES_2030, COUL,
     fmt_fr, fmt_m, fmt_pct,
     calculer_scenario, PARAMS_BASE, construire_lignes, generer_faits_saillants,
+    COUSSINS, POIDS_COUSSINS, CATEGORIES_COUTS, ALLOC_BLOCS_VERS_CATEGORIES,
+    BLOCS_COUTS, CLASSES_ACTIFS, POIDS_ACTIFS, RDT_CLASSES_DEFAUT,
+    rendement_pondere, ORACLE_MAPPING,
 )
 
 plt.rcParams.update({
@@ -257,6 +260,13 @@ def afficher_fig(fig):
 st.set_page_config(page_title="Plan financier par leviers — Assurance individuelle",
                    page_icon="📊", layout="wide")
 
+st.markdown("""<style>
+div[data-testid="stMetric"]{background:#FFFFFF;border:1px solid #E8E8E4;
+  border-radius:12px;padding:14px 18px;box-shadow:0 1px 3px rgba(0,0,0,.05);}
+div[data-testid="stMetric"] label{color:#7F8C8D;}
+div[data-testid="stVerticalBlockBorderWrapper"]{border-radius:12px;}
+</style>""", unsafe_allow_html=True)
+
 st.title("📊 Plan financier simplifié par leviers — Assurance individuelle")
 st.caption("⚠️ **Données synthétiques à des fins de démonstration** · IFRS 17 · "
            "2025 (estimé) → 2030 · POC Databricks App")
@@ -293,7 +303,8 @@ FAMILLES_COURTES = ["VE participation", "VE paiements limités", "Autres VE",
                     "Temporaires", "Maladies graves", "Autres inv. et maladie"]
 CLES_B = [f"k_b_{i}" for i in range(len(PRODUITS))]
 CLES_DEFAUTS = {"k_scen": "Base", "k_vol": 1.00, "k_ind": 60, "k_dsj": 25, "k_agt": 15,
-                "k_rdt": 3.50, "k_gacq": 3.5, "k_gattr": 3.0, "k_gna": 2.0,
+                "k_gacq": 3.5, "k_gattr": 3.0, "k_gna": 2.0,
+                **{f"k_rc_{i}": RDT_CLASSES_DEFAUT[i] for i in range(len(CLASSES_ACTIFS))},
                 **{c: 0.0 for c in CLES_B}}
 for cle, defaut in CLES_DEFAUTS.items():
     st.session_state.setdefault(cle, defaut)
@@ -324,8 +335,12 @@ with st.sidebar.expander("C — Mix canal (%)", expanded=False):
     parts_canal = [p_ind / total_c, p_dsj / total_c, p_agt / total_c]
     st.caption("Renormalisé : " + " / ".join(f"{p*100:.0f} %" for p in parts_canal))
 
-rendement = st.sidebar.slider("D — Rendement de placement (%)", 2.50, 5.00,
-                              step=0.05, key="k_rdt") / 100.0
+with st.sidebar.expander("D — Rendement par classe d'actifs (%)", expanded=False):
+    rdt_classes = [st.slider(f"{CLASSES_ACTIFS[i]} ({POIDS_ACTIFS[i]*100:.0f} %)",
+                             0.5, 12.0, step=0.05, key=f"k_rc_{i}")
+                   for i in range(len(CLASSES_ACTIFS))]
+    rendement = rendement_pondere(rdt_classes)
+    st.caption(f"Rendement global pondéré : **{rendement*100:.2f} %**")
 
 with st.sidebar.expander("E — Croissance des dépenses (%/an)", expanded=False):
     g_acq = st.slider("Coûts d'acquisition", 0.0, 8.0, step=0.1, key="k_gacq") / 100.0
@@ -334,6 +349,7 @@ with st.sidebar.expander("E — Croissance des dépenses (%/an)", expanded=False
 
 params = dict(fact_volume=float(fact_volume), croiss_fam=[float(c) for c in croiss_fam],
               parts_canal=[float(p) for p in parts_canal], rendement=float(rendement),
+              rdt_classes=[float(r) for r in rdt_classes],
               g_acq=float(g_acq), g_attr=float(g_attr), g_na=float(g_na))
 
 # ---- Recalcul instantané (moment « wow » A) ------------------------------------
@@ -378,11 +394,19 @@ if conn_ok:
                         "k_ind": int(round(lev.get("C_part_independants", 0.60) / total * 100)),
                         "k_dsj": int(round(lev.get("C_part_desjardins", 0.25) / total * 100)),
                         "k_agt": int(round(lev.get("C_part_agents", 0.15) / total * 100)),
-                        "k_rdt": round(lev.get("D_rendement_placement", 0.035) * 100, 2),
+
                         "k_gacq": round(lev.get("E_croiss_couts_acquisition", 0.035) * 100, 1),
                         "k_gattr": round(lev.get("E_croiss_couts_attribuables", 0.030) * 100, 1),
                         "k_gna": round(lev.get("E_croiss_couts_non_attrib", 0.020) * 100, 1),
                     }
+                    if any(l.startswith("D_rdt_") for l in lev):
+                        for i, cl in enumerate(CLASSES_ACTIFS):
+                            charge[f"k_rc_{i}"] = round(
+                                lev.get(f"D_rdt_{cl}", RDT_CLASSES_DEFAUT[i] / 100.0) * 100, 2)
+                    else:   # ancien scénario (levier D scalaire) : mise à l'échelle des défauts
+                        ratio = lev.get("D_rendement_placement", 0.0351) / 0.0351
+                        for i in range(len(CLASSES_ACTIFS)):
+                            charge[f"k_rc_{i}"] = round(RDT_CLASSES_DEFAUT[i] * ratio, 2)
                     for i, p in enumerate(PRODUITS):   # levier B par famille (0 si absent
                         charge[CLES_B[i]] = round(     # -> scénario écrit avant la refonte B)
                             float(lev.get(f"B_croiss_{p}", 0.0)), 1)
@@ -429,31 +453,127 @@ with st.container(border=True):
         st.markdown(f"- {fait}")
 
 # ---- Onglets ---------------------------------------------------------------------
-ong1, ong2, ong3, ong4 = st.tabs(
-    ["📊 Tableau de bord", "🔁 Roll-forward CSM", "⚖️ Comparaison de scénarios", "📄 Détail"]
+ong1, ong_cap, ong_cout, ong2, ong3, ong4 = st.tabs(
+    ["📊 Tableau de bord", "🏛️ Capital", "💸 Coûts",
+     "🔁 Roll-forward CSM", "⚖️ Comparaison", "📄 Détail"]
 )
 
+def valeurs_vue(series_list, jf, cumulatif):
+    """Vue annuelle (valeur de l'année focus) ou cumulative (somme 2025 -> focus)."""
+    return [float(np.sum(s[:jf + 1])) if cumulatif else float(s[jf]) for s in series_list]
+
 with ong1:
+    vue = st.radio("Vue des waterfalls", ["Annuelle", "Cumulative depuis 2025"],
+                   horizontal=True, key="k_vue_src")
+    cumul = vue.startswith("Cumulative")
+    suffixe = f"cumul 2025-{annee_focus}" if cumul else str(annee_focus)
     gauche, droite = st.columns([1.15, 1])
     with gauche:
+        vals_src = valeurs_vue([res["profit_attendu"], res["impact_ventes"],
+                                res["experience"], res["depenses"],
+                                res["interet_marche"], res["exploitation"]], jf, cumul)
         afficher_fig(fig_waterfall(
             ["Profit attendu (CSM + RA)", "Impact des ventes", "Expérience",
              "Dépenses", "Intérêt et marché", "Résultat d'exploitation"],
-            [res["profit_attendu"][jf], res["impact_ventes"][jf], res["experience"][jf],
-             res["depenses"][jf], res["interet_marche"][jf], res["exploitation"][jf]],
-            f"Sources de bénéfices {annee_focus} — « {scenario_id} » (M$)"))
+            vals_src,
+            f"Sources de bénéfices {suffixe} — « {scenario_id} » (M$)"))
     with droite:
         afficher_fig(fig_heatmap(res["rsi_adj"], rendement, scenario_id))
     afficher_fig(fig_trajectoires(res, res_base, scenario_id))
 
+with ong_cap:
+    st.markdown(f"**Capital requis par catégorie de coussin — « {scenario_id} »** "
+                "*(poids par coussin : hypothèses de démonstration)*")
+    cc = res["capital_coussins"]           # (6 coussins x années), Diversification < 0
+    couleurs_c = [COUL["bleu"], COUL["vert"], COUL["or"], "#8E44AD", "#16A085", COUL["rouge"]]
+    g1, g2 = st.columns([1.15, 1])
+    with g1:
+        fig, ax = plt.subplots(figsize=(8.5, 4.6))
+        bas = np.zeros(N)
+        for i, c in enumerate(COUSSINS):
+            if POIDS_COUSSINS[i] >= 0:
+                ax.bar(ANNEES, cc[i], bottom=bas, color=couleurs_c[i], width=0.62,
+                       label=c, zorder=3)
+                bas += cc[i]
+            else:
+                ax.bar(ANNEES, cc[i], bottom=0, color=couleurs_c[i], width=0.62,
+                       label=f"{c} (réduction)", hatch="//", zorder=3)
+        ax.plot(ANNEES, res["capital"], marker="o", color="black", linewidth=2.2,
+                label="Capital net à rémunérer", zorder=4)
+        ax.axhline(0, color=COUL["gris"], linewidth=0.8)
+        ax.set_title("Empilement des coussins et capital net (M$)")
+        ax.set_xticks(ANNEES)
+        ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: fmt_fr(x)))
+        ax.legend(fontsize=8, ncol=2)
+        fig.tight_layout()
+        afficher_fig(fig)
+    with g2:
+        vals_cap = [float(cc[i][jf]) for i in range(len(COUSSINS))] + [float(res["capital"][jf])]
+        afficher_fig(fig_waterfall(
+            COUSSINS + ["Capital net"], vals_cap,
+            f"Composition du capital {annee_focus} (M$)",
+            plafond=float(cc[:5, jf].sum()) * 1.2))
+    tbl_cap = pd.DataFrame(cc.round(0), index=COUSSINS,
+                           columns=[str(a) for a in ANNEES])
+    tbl_cap.loc["Capital net à rémunérer"] = res["capital"].round(0)
+    st.dataframe(tbl_cap.reset_index(names="Coussin (M$)"), hide_index=True, width="stretch")
+
+with ong_cout:
+    st.markdown(f"**Cost module — rétro-allocation vers les catégories avant allocation** "
+                f"*(« {scenario_id} », piloté par le levier E)*")
+    ca = res["couts_avant"]                # (8 catégories x années)
+    couleurs_k = ["#1F5673", "#00874E", "#B8860B", "#8E44AD", "#16A085",
+                  "#C0392B", "#7F8C8D", "#2C3E50"]
+    g1, g2 = st.columns([1.15, 1])
+    with g1:
+        fig, ax = plt.subplots(figsize=(8.5, 4.6))
+        bas = np.zeros(N)
+        for i, c in enumerate(CATEGORIES_COUTS):
+            ax.bar(ANNEES, ca[i], bottom=bas, color=couleurs_k[i], width=0.62,
+                   label=c, zorder=3)
+            bas += ca[i]
+        ax.set_title("Coûts avant allocation par catégorie (M$)")
+        ax.set_xticks(ANNEES)
+        ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: fmt_fr(x)))
+        ax.legend(fontsize=7.5, ncol=2)
+        fig.tight_layout()
+        afficher_fig(fig)
+    with g2:
+        fig, ax = plt.subplots(figsize=(7.5, 4.6))
+        for k, b in enumerate(BLOCS_COUTS):
+            ax.plot(ANNEES, res["couts_blocs"][k], marker="o", linewidth=2.2,
+                    color=[COUL["bleu"], COUL["vert"], COUL["or"]][k], label=b)
+        ax.set_title("Blocs post-allocation (M$) — leviers E")
+        ax.set_xticks(ANNEES)
+        ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: fmt_fr(x)))
+        ax.legend(fontsize=8.5)
+        fig.tight_layout()
+        afficher_fig(fig)
+    tbl_ca = pd.DataFrame(ca.round(1), index=CATEGORIES_COUTS,
+                          columns=[str(a) for a in ANNEES])
+    tbl_ca.loc["Total"] = ca.sum(axis=0).round(1)
+    st.dataframe(tbl_ca.reset_index(names="Catégorie (M$)"), hide_index=True, width="stretch")
+    with st.expander("Matrice de rétro-allocation (blocs → catégories, hypothèses)"):
+        mat = pd.DataFrame(ALLOC_BLOCS_VERS_CATEGORIES * 100, index=BLOCS_COUTS,
+                           columns=CATEGORIES_COUTS).round(0).astype(int)
+        st.dataframe(mat.reset_index(names="Bloc \\ Catégorie (%)"),
+                     hide_index=True, width="stretch")
+
 with ong2:
+
+    vue_csm = st.radio("Vue", ["Annuelle", "Cumulative depuis 2025"],
+                       horizontal=True, key="k_vue_csm")
+    cumul_csm = vue_csm.startswith("Cumulative")
+    depart = res["csm_open"][0] if cumul_csm else res["csm_open"][jf]
+    flux = valeurs_vue([-res["csm_release"], res["nb_csm"], res["csm_interet"],
+                        np.full(N, res["exp_csm"]), res["chg_hyp"]], jf, cumul_csm)
+    suff_csm = f"cumul 2025-{annee_focus}" if cumul_csm else str(annee_focus)
     afficher_fig(fig_waterfall(
         ["Solde CSM départ", "Profit attendu relâché", "Impact des ventes profitables",
          "Intérêt et marché", "Expérience", "Changements d'hypothèses", "Solde CSM fin"],
-        [res["csm_open"][jf], -res["csm_release"][jf], res["nb_csm"][jf],
-         res["csm_interet"][jf], res["exp_csm"], res["chg_hyp"][jf], res["csm_close"][jf]],
-        f"Roll-forward du CSM {annee_focus} — « {scenario_id} » (M$)",
-        plafond=max(res["csm_open"][jf], res["csm_close"][jf]) * 1.18))
+        [depart] + flux + [res["csm_close"][jf]],
+        f"Roll-forward du CSM {suff_csm} — « {scenario_id} » (M$)",
+        plafond=max(depart, res["csm_close"][jf]) * 1.18))
     st.dataframe(pd.DataFrame({
         "Année": ANNEES,
         "Solde départ (M$)": res["csm_open"].round(0),
@@ -526,6 +646,12 @@ with ong4:
     ventes_df = pd.DataFrame(res["ventes_scen"].round(0), index=PRODUITS,
                              columns=[str(a) for a in ANNEES]).reset_index(names="Produit")
     st.dataframe(ventes_df, hide_index=True, width="stretch")
+
+    st.markdown("**Correspondance dimensions FP → Oracle EPM** "
+                "*(format d'export : Account · Entity · Scenario · Version · Period · Year · LOB · Amount)*")
+    st.dataframe(ORACLE_MAPPING.rename(columns={
+        "ligne_fp": "Ligne du plan", "compte_oracle": "Compte Oracle",
+        "description_oracle": "Description EPM"}), hide_index=True, width="stretch")
 
     st.download_button(
         "⬇️ Télécharger le P&L (CSV)",
