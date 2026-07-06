@@ -1,0 +1,328 @@
+# -*- coding: utf-8 -*-
+"""
+moteur_plan.py — SOURCE UNIQUE DE VÉRITÉ du POC « Plan financier par leviers »
+================================================================================
+Constantes métier, baseline synthétique, moteur de calcul, préparation des lignes
+Gold et faits saillants. Importé PAR LES DEUX livrables :
+  - le notebook Databricks (Phase 1)  ->  import moteur_plan as mp
+  - l'app Streamlit (Phase 2)         ->  from moteur_plan import ...
+
+⚠️ Données 100 % synthétiques. ECHELLE décale volontairement tous les niveaux
+monétaires de tout ordre de grandeur réel (les ratios restent cohérents).
+
+Aucune dépendance à Streamlit ni à Spark : numpy + pandas seulement.
+"""
+
+import numpy as np
+import pandas as pd
+from datetime import datetime
+
+SCHEMA_DEFAUT = "plan_assurance_ind_v1"
+ANNEES = list(range(2025, 2031))
+N = len(ANNEES)
+
+PRODUITS = [
+    "Vie entière avec participation", "Vie entière à paiements limités",
+    "Autres vies entières", "Temporaires", "Maladies graves",
+    "Autres invalidité et maladie",
+]
+CANAUX = ["Indépendants", "Desjardins", "Agents Desjardins"]
+
+# ---- Facteur d'échelle de camouflage -----------------------------------------
+# Tous les NIVEAUX monétaires (ventes, P&L, CSM, capital, coûts, polices) sont
+# multipliés par ECHELLE pour s'éloigner de tout ordre de grandeur réel.
+# Les RATIOS (RSI, marges, coût par police) restent cohérents entre eux.
+ECHELLE = 2.0
+
+# 6 familles (ODS et « Autres » retirées du périmètre à la demande du métier)
+VENTES_2025 = np.array([39510, 5400, 8660, 24723, 20940, 4300], dtype=float) * ECHELLE
+VENTES_2030 = np.array([68674, 8520, 13970, 35680, 32020, 6330], dtype=float) * ECHELLE
+
+RSI_MATRICE = pd.DataFrame(
+    {
+        "Indépendants":      [5.6, 1.8, 9.2, 7.3, 17.1, np.nan],
+        "Desjardins":        [3.1, 16.7, 55.6, 6.9, 5.2, np.nan],
+        "Agents Desjardins": [np.nan, 1.4, -1.2, -10.5, -0.6, -5.3],
+    },
+    index=PRODUITS,
+)
+VAN_2025 = np.array([-12848, 3005, 900, 1177, 748, -2024], dtype=float) * ECHELLE
+MARGE_VAN = VAN_2025 / VENTES_2025
+
+BASE_COUTS = np.array([95.0, 48.0, 14.6]) * ECHELLE   # acquisition / attribuables / non attr. (M$)
+# Échelle distincte pour les polices -> le coût unitaire par police est lui aussi
+# décalé des valeurs d'origine (≈ 4 034 $ -> 3 381 $ au lieu de 3 026 -> 2 536 $).
+POLICES_2025, POLICES_2030 = 52083.0 * 1.5, 72000.0 * 1.5
+
+COUL = {"vert": "#00874E", "rouge": "#C0392B", "bleu": "#1F5673",
+        "gris": "#7F8C8D", "or": "#B8860B", "fond": "#F7F7F5"}
+
+def fmt_fr(x, dec=0, suffixe=""):
+    return f"{x:,.{dec}f}".replace(",", " ").replace(".", ",") + suffixe
+
+def fmt_m(x, dec=0):
+    return fmt_fr(x, dec, " M$")
+
+def fmt_pct(x, dec=1):
+    return fmt_fr(x, dec, " %")
+
+def ventes_baseline():
+    """Interpolation géométrique 2025->2030 par famille + léger bruit (seed 42).
+    Périmètre 6 familles : total 2025 ≈ 103,5 M$, 2030 ≈ 165,2 M$ (~9,8 %/an)."""
+    rng = np.random.default_rng(42)
+    tx = (VENTES_2030 / VENTES_2025) ** (1 / (N - 1))
+    v = np.array([VENTES_2025 * tx**t for t in range(N)]).T
+    bruit = 1 + rng.uniform(-0.015, 0.015, size=v.shape)
+    bruit[:, 0] = 1.0
+    bruit[:, -1] = 1.0
+    v *= bruit
+    return v
+
+VENTES_BASE = ventes_baseline()
+
+def calculer_scenario(scenario_id, fact_volume, croiss_fam, parts_canal,
+                      rendement, g_acq, g_attr, g_na):
+    """croiss_fam : ajustement de croissance PAR FAMILLE, en points de %/an vs le plan
+    (ex. +2.0 -> la famille croît 2 pts plus vite chaque année que sa trajectoire de base)."""
+    t_idx = np.arange(N)
+    rsi_mat = RSI_MATRICE.to_numpy()
+
+    # Levier B : chaque famille suit sa trajectoire de base × (1 + ajustement)^t
+    adj = np.array(croiss_fam, dtype=float) / 100.0            # points -> fraction
+    facteur_fam = (1.0 + adj[:, None]) ** t_idx[None, :]        # (familles x années)
+    ventes_scen = VENTES_BASE * fact_volume * facteur_fam
+
+    ventes_tot_m = ventes_scen.sum(axis=0) / 1000.0
+    ventes_pc = ventes_scen[:, :, None] * np.array(parts_canal)[None, None, :]
+
+    rsi_adj = rsi_mat + (rendement - 0.035) * 100 * 0.8
+    masque = ~np.isnan(rsi_mat)
+    rsi_nb = np.array([
+        np.nansum(np.where(masque, rsi_adj, 0) * ventes_pc[:, j, :]) /
+        max(1e-9, (ventes_pc[:, j, :] * masque).sum())
+        for j in range(N)
+    ])
+
+    van_k = MARGE_VAN[:, None] * ventes_scen + ventes_scen * (rendement - 0.035) * 2.0
+    van_tot_m = van_k.sum(axis=0) / 1000.0
+
+    marge_csm = np.linspace(0.75, 1.03, N)
+    nb_csm = marge_csm * ventes_tot_m                      # ventes déjà à l'échelle
+    # Changements d'hypothèses lissés (plus de choc -37 en 2025 -> trajectoire douce)
+    chg_hyp = np.array([-12, -8, -4, 0, 6, 12], dtype=float) * ECHELLE
+    exp_csm = 12.0 * ECHELLE
+    csm_open, csm_close, csm_release, csm_interet = [], [], [], []
+    solde = 1937.0 * ECHELLE
+    for j in range(N):
+        rel = 0.071 * solde
+        inte = 0.0315 * solde * (rendement / 0.035)
+        fin = solde - rel + nb_csm[j] + inte + exp_csm + chg_hyp[j]
+        csm_open.append(solde); csm_release.append(rel)
+        csm_interet.append(inte); csm_close.append(fin)
+        solde = fin
+    csm_open, csm_close = np.array(csm_open), np.array(csm_close)
+    csm_release, csm_interet = np.array(csm_release), np.array(csm_interet)
+
+    ra_release = 31.0 * ECHELLE * 1.05 ** t_idx
+    profit_attendu = csm_release + ra_release
+    impact_ventes = 0.11 * van_tot_m
+    experience = (15.0 + 1.5 * t_idx) * ECHELLE
+
+    acq = BASE_COUTS[0] * (1 + g_acq) ** t_idx
+    attr = BASE_COUTS[1] * (1 + g_attr) ** t_idx
+    na = BASE_COUTS[2] * (1 + g_na) ** t_idx
+    depenses_src = -(attr + na + 0.30 * acq)
+
+    capital = np.linspace(464.0, 581.0, N) * ECHELLE * (0.85 + 0.15 * fact_volume)
+    actifs = capital * 5.6
+    # Accrétion des passifs LINÉAIRE : plus de « boom » 2025 -> trajectoire lisse,
+    # calibrée pour un RSI ~25 % qui glisse doucement vers ~22 %.
+    accretion_passifs = np.linspace(30.0, 49.0, N) * ECHELLE
+    interet_marche = actifs * rendement - accretion_passifs
+
+    activites = profit_attendu + impact_ventes + experience
+    exploitation = activites + interet_marche + depenses_src
+    impots = np.where(exploitation > 0, 0.24 * exploitation, 0.0)
+    resultat_net = exploitation - impots
+
+    echelle_vol = 0.85 + 0.15 * fact_volume
+    produits_ass = np.linspace(669.0, 806.0, N) * ECHELLE * echelle_vol
+    charges_ass = np.linspace(450.0, 561.0, N) * ECHELLE * echelle_vol
+    reassurance = activites - (produits_ass - charges_ass)
+    rsi_global = resultat_net / capital * 100.0
+
+    polices = np.linspace(POLICES_2025, POLICES_2030, N) * fact_volume
+    cout_par_police = (acq + attr + na) * 1_000_000.0 / polices
+
+    return {
+        "scenario_id": scenario_id, "ventes_scen": ventes_scen, "ventes_pc": ventes_pc,
+        "rsi_adj": rsi_adj, "masque": masque, "van_k": van_k,
+        "resultat_net": resultat_net, "exploitation": exploitation,
+        "rsi_global": rsi_global, "rsi_nb": rsi_nb, "van_tot_m": van_tot_m,
+        "csm_open": csm_open, "csm_close": csm_close, "csm_release": csm_release,
+        "csm_interet": csm_interet, "nb_csm": nb_csm, "chg_hyp": chg_hyp,
+        "exp_csm": exp_csm, "profit_attendu": profit_attendu,
+        "impact_ventes": impact_ventes, "experience": experience,
+        "depenses": depenses_src, "interet_marche": interet_marche,
+        "capital": capital, "cout_par_police": cout_par_police, "polices": polices,
+        "produits_ass": produits_ass, "charges_ass": charges_ass,
+        "reassurance": reassurance, "impots": impots, "activites": activites,
+    }
+
+PARAMS_BASE = dict(fact_volume=1.0, croiss_fam=[0.0] * len(PRODUITS),
+                   parts_canal=[0.60, 0.25, 0.15], rendement=0.035,
+                   g_acq=0.035, g_attr=0.030, g_na=0.020)
+
+def construire_lignes(res, params, scenario_id):
+    """Prépare les lignes overlay / forecast / kpi / dim (mêmes formats que Phase 1)."""
+    horo = datetime.now().isoformat(timespec="seconds")
+    pc = params["parts_canal"]
+
+    overlay = [
+        (scenario_id, "A_facteur_volume", params["fact_volume"], 1.00, horo),
+        (scenario_id, "C_part_independants", pc[0], 0.60, horo),
+        (scenario_id, "C_part_desjardins", pc[1], 0.25, horo),
+        (scenario_id, "C_part_agents", pc[2], 0.15, horo),
+        (scenario_id, "D_rendement_placement", params["rendement"], 0.035, horo),
+        (scenario_id, "E_croiss_couts_acquisition", params["g_acq"], 0.035, horo),
+        (scenario_id, "E_croiss_couts_attribuables", params["g_attr"], 0.030, horo),
+        (scenario_id, "E_croiss_couts_non_attrib", params["g_na"], 0.020, horo),
+    ] + [
+        (scenario_id, f"B_croiss_{p}", float(params["croiss_fam"][i]), 0.00, horo)
+        for i, p in enumerate(PRODUITS)
+    ]
+
+    sections = {
+        "etat_resultats": [
+            ("Produits d'assurance", res["produits_ass"]),
+            ("Charges d'assurance", -res["charges_ass"]),
+            ("Réassurance nette", res["reassurance"]),
+            ("Résultats des activités d'assurance", res["activites"]),
+            ("Résultat financier", res["interet_marche"]),
+            ("Résultats autres", res["depenses"]),
+            ("Résultat d'exploitation", res["exploitation"]),
+            ("Impôts", -res["impots"]),
+            ("Résultat net", res["resultat_net"]),
+        ],
+        "sources_benefices": [
+            ("Profit attendu (CSM + RA)", res["profit_attendu"]),
+            ("Impact des ventes", res["impact_ventes"]),
+            ("Expérience", res["experience"]),
+            ("Dépenses", res["depenses"]),
+            ("Intérêt et marché", res["interet_marche"]),
+            ("Résultat d'exploitation", res["exploitation"]),
+        ],
+        "csm_rollforward": [
+            ("Solde CSM départ", res["csm_open"]),
+            ("Profit attendu relâché", -res["csm_release"]),
+            ("Impact des ventes profitables", res["nb_csm"]),
+            ("Intérêt et marché", res["csm_interet"]),
+            ("Expérience", np.full(N, res["exp_csm"])),
+            ("Changements d'hypothèses", res["chg_hyp"]),
+            ("Solde CSM fin", res["csm_close"]),
+        ],
+        "capital": [
+            ("Capital à rémunérer moyen", res["capital"]),
+            ("Actifs investis (proxy)", res["capital"] * 5.6),
+        ],
+    }
+    forecast = []
+    for section, lignes_sec in sections.items():
+        for ordre, (ligne, serie) in enumerate(lignes_sec, start=1):
+            for j, a in enumerate(ANNEES):
+                forecast.append((scenario_id, a, section, ligne, ordre,
+                                 round(float(serie[j]), 2)))
+
+    kpi = []
+    for j, a in enumerate(ANNEES):
+        for nom, valr, unite in [
+            ("resultat_net_m", res["resultat_net"][j], "M$"),
+            ("resultat_exploitation_m", res["exploitation"][j], "M$"),
+            ("rsi_global_pct", res["rsi_global"][j], "%"),
+            ("rsi_nouvelles_affaires_pct", res["rsi_nb"][j], "%"),
+            ("van_totale_m", res["van_tot_m"][j], "M$"),
+            ("csm_solde_fin_m", res["csm_close"][j], "M$"),
+            ("capital_a_remunerer_m", res["capital"][j], "M$"),
+            ("cout_acquisition_par_police_$", res["cout_par_police"][j], "$"),
+            ("polices_emises", res["polices"][j], "nb"),
+            ("ventes_totales_k", res["ventes_scen"][:, j].sum(), "K$"),
+        ]:
+            kpi.append((scenario_id, a, "global", "Tous", "Tous", nom,
+                        round(float(valr), 2), unite))
+        for i, p in enumerate(PRODUITS):
+            kpi.append((scenario_id, a, "produit", p, "Tous", "ventes_k",
+                        round(float(res["ventes_scen"][i, j]), 1), "K$"))
+            kpi.append((scenario_id, a, "produit", p, "Tous", "van_k",
+                        round(float(res["van_k"][i, j]), 1), "K$"))
+            for c_i, c in enumerate(CANAUX):
+                kpi.append((scenario_id, a, "produit_canal", p, c, "ventes_k",
+                            round(float(res["ventes_pc"][i, j, c_i]), 1), "K$"))
+                if res["masque"][i, c_i]:
+                    kpi.append((scenario_id, a, "produit_canal", p, c, "rsi_pct",
+                                round(float(res["rsi_adj"][i, c_i]), 2), "%"))
+
+    # accent_croissance (ancien levier B) omis -> NULL ; les leviers B par famille
+    # vivent désormais dans overlay_drivers_slv (format long, flexible).
+    dim = [(scenario_id, horo, params["fact_volume"],
+            pc[0], pc[1], pc[2], params["rendement"], params["g_acq"],
+            params["g_attr"], params["g_na"])]
+    return overlay, forecast, kpi, dim
+
+def generer_faits_saillants(res, res_base, params, jf, annee_focus, scenario_id):
+    """Faits saillants générés automatiquement à partir des résultats (règles métier).
+    Alternative légère et 100 % fiable en démo à un Genie embarqué."""
+    faits = []
+
+    # 1) Écart vs Base + levier dominant
+    d_net = res["resultat_net"][jf] - res_base["resultat_net"][jf]
+    ecarts_lev = {
+        "le volume (A)": abs(params["fact_volume"] - 1.0) / 0.10,
+        "la croissance par famille (B)": max(abs(c) for c in params["croiss_fam"]) / 2.0,
+        "le mix canal (C)": max(abs(params["parts_canal"][0] - 0.60),
+                                abs(params["parts_canal"][1] - 0.25),
+                                abs(params["parts_canal"][2] - 0.15)) / 0.05,
+        "le rendement de placement (D)": abs(params["rendement"] - 0.035) / 0.0025,
+        "les dépenses (E)": max(abs(params["g_acq"] - 0.035), abs(params["g_attr"] - 0.030),
+                                abs(params["g_na"] - 0.020)) / 0.005,
+    }
+    levier_dom = max(ecarts_lev, key=ecarts_lev.get)
+    if max(ecarts_lev.values()) < 0.01:
+        faits.append(f"⚖️ Le scénario « {scenario_id} » est aligné sur la baseline : "
+                     f"aucun levier n'a été bougé.")
+    else:
+        sens = "au-dessus" if d_net >= 0 else "en dessous"
+        faits.append(f"⚖️ Résultat net {annee_focus} : **{fmt_m(abs(d_net))} {sens} de la "
+                     f"baseline** ; principal levier actionné : **{levier_dom}**.")
+
+    # 2) Meilleure et pire cellule RSI produit × canal
+    rsi = res["rsi_adj"]
+    i_max = np.unravel_index(np.nanargmax(rsi), rsi.shape)
+    i_min = np.unravel_index(np.nanargmin(rsi), rsi.shape)
+    faits.append(f"🏆 Meilleur RSI des ventes : **{PRODUITS[i_max[0]]} × {CANAUX[i_max[1]]}** "
+                 f"à **{fmt_pct(rsi[i_max])}** ; le plus faible : "
+                 f"{PRODUITS[i_min[0]]} × {CANAUX[i_min[1]]} à {fmt_pct(rsi[i_min])}.")
+
+    # 3) Produits destructeurs de valeur (VAN négative, année focus)
+    van_focus = res["van_k"][:, jf] / 1000.0
+    negatifs = [(PRODUITS[i], van_focus[i]) for i in range(len(PRODUITS)) if van_focus[i] < -0.5]
+    if negatifs:
+        pire = min(negatifs, key=lambda x: x[1])
+        faits.append(f"🔻 {len(negatifs)} famille(s) détruisent de la valeur en {annee_focus} "
+                     f"(VAN totale {fmt_m(res['van_tot_m'][jf], 1)}) ; la plus déficitaire : "
+                     f"**{pire[0]}** à {fmt_m(pire[1], 1)}.")
+    else:
+        faits.append(f"🟢 Aucune famille ne détruit de valeur en {annee_focus} — "
+                     f"VAN totale : {fmt_m(res['van_tot_m'][jf], 1)}.")
+
+    # 4) Trajectoire CSM et coûts unitaires sur l'horizon
+    d_csm = res["csm_close"][-1] - res["csm_open"][0]
+    faits.append(f"📈 Le solde CSM passe de {fmt_m(res['csm_open'][0])} à "
+                 f"**{fmt_m(res['csm_close'][-1])}** sur l'horizon "
+                 f"({'+' if d_csm >= 0 else ''}{fmt_fr(d_csm / res['csm_open'][0] * 100, 1)} %).")
+    d_cpp = res["cout_par_police"][-1] - res["cout_par_police"][0]
+    tendance = "baisse" if d_cpp < 0 else "hausse"
+    faits.append(f"💰 Coût d'acquisition moyen par police en **{tendance}** : "
+                 f"{fmt_fr(res['cout_par_police'][0])} $ → "
+                 f"{fmt_fr(res['cout_par_police'][-1])} $ "
+                 f"(effet volume vs croissance des dépenses).")
+    return faits
