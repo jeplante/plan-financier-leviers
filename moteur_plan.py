@@ -79,6 +79,26 @@ ALLOC_BLOCS_VERS_CATEGORIES = np.array([
 BLOCS_COUTS = ["Coûts d'acquisition", "Coûts attribuables récurrents",
                "Coûts non attribuables"]
 
+# ---- VP fictives responsables de chaque catégorie (démonstration) ------------------
+VP_CATEGORIES = ["VP Produits et actuariat", "VP Distribution", "VP Opérations",
+                 "VP Réclamations", "VP Marketing", "VP Transformation",
+                 "VP Services corporatifs", "VP Technologies"]
+
+# ---- Modèle de coûts PILOTÉ PRÉ-ALLOCATION ------------------------------------------
+# Les 8 catégories (une par VP) sont la SOURCE ; l'allocation vers les 3 blocs
+# post-allocation en découle, puis alimente le P&L et la rentabilité.
+# Bases 2025 par catégorie = rétro-allocation des blocs 2025 (cohérence historique).
+_BLOCS_2025 = np.array([95.0, 48.0, 14.6]) * ECHELLE
+CAT_BASE_2025 = ALLOC_BLOCS_VERS_CATEGORIES.T @ _BLOCS_2025            # (8,)
+# Matrice d'allocation catégories -> blocs (inversion bayésienne : chaque ligne = 1)
+ALLOC_CATEGORIES_VERS_BLOCS = (ALLOC_BLOCS_VERS_CATEGORIES
+                               * _BLOCS_2025[:, None]).T / CAT_BASE_2025[:, None]
+# Croissances par défaut par catégorie (%/an) = CAGR implicite de l'ancien modèle
+# (blocs à 3,5 / 3,0 / 2,0 %/an) -> la baseline reste quasi identique.
+_blocs_2030 = _BLOCS_2025 * (1 + np.array([0.035, 0.030, 0.020])) ** 5
+_cat_2030 = ALLOC_BLOCS_VERS_CATEGORIES.T @ _blocs_2030
+CROISS_CATEGORIES_DEFAUT = ((_cat_2030 / CAT_BASE_2025) ** (1 / 5) - 1) * 100  # en %
+
 # ---- Levier D granularisé par classe d'actifs --------------------------------------
 CLASSES_ACTIFS = ["Revenu fixe", "Revenus variables (actions)",
                   "Immobilier", "Placements alternatifs"]
@@ -156,11 +176,15 @@ def ventes_baseline():
 VENTES_BASE = ventes_baseline()
 
 def calculer_scenario(scenario_id, fact_volume, croiss_fam, parts_canal,
-                      rendement, g_acq, g_attr, g_na, rdt_classes=None):
+                      rendement, g_acq, g_attr, g_na, rdt_classes=None,
+                      croiss_categories=None):
     """croiss_fam : ajustement de croissance PAR FAMILLE, en points de %/an vs le plan
     (ex. +2.0 -> la famille croît 2 pts plus vite chaque année que sa trajectoire de base).
     rdt_classes : rendements par classe d'actifs (%) — informatif ; le calcul utilise
-    `rendement` (déjà pondéré via rendement_pondere), les classes sont tracées en overlay."""
+    `rendement` (déjà pondéré via rendement_pondere), les classes sont tracées en overlay.
+    croiss_categories : croissances PRÉ-ALLOCATION par catégorie/VP (%/an). Si fourni,
+    les 8 catégories sont la SOURCE et les blocs post-allocation en découlent ;
+    sinon (mode hérité, notebook), les blocs sont pilotés par g_acq/g_attr/g_na."""
     t_idx = np.arange(N)
     rsi_mat = RSI_MATRICE.to_numpy()
 
@@ -205,18 +229,26 @@ def calculer_scenario(scenario_id, fact_volume, croiss_fam, parts_canal,
     impact_ventes = 0.11 * van_tot_m
     experience = (15.0 + 1.5 * t_idx) * ECHELLE
 
-    acq = BASE_COUTS[0] * (1 + g_acq) ** t_idx
-    attr = BASE_COUTS[1] * (1 + g_attr) ** t_idx
-    na = BASE_COUTS[2] * (1 + g_na) ** t_idx
+    if croiss_categories is not None:
+        # Modèle piloté PRÉ-ALLOCATION : chaque catégorie (VP) croît à son taux,
+        # puis s'alloue vers les 3 blocs -> dépenses du P&L -> rentabilité.
+        g_cat = np.asarray(croiss_categories, dtype=float) / 100.0
+        couts_avant = CAT_BASE_2025[:, None] * (1 + g_cat[:, None]) ** t_idx[None, :]
+        couts_blocs = ALLOC_CATEGORIES_VERS_BLOCS.T @ couts_avant
+        acq, attr, na = couts_blocs
+    else:
+        # Mode hérité (widgets du notebook) : blocs pilotés directement
+        acq = BASE_COUTS[0] * (1 + g_acq) ** t_idx
+        attr = BASE_COUTS[1] * (1 + g_attr) ** t_idx
+        na = BASE_COUTS[2] * (1 + g_na) ** t_idx
+        couts_blocs = np.vstack([acq, attr, na])
+        couts_avant = ALLOC_BLOCS_VERS_CATEGORIES.T @ couts_blocs
     depenses_src = -(attr + na + 0.30 * acq)
 
     capital = np.linspace(464.0, 581.0, N) * ECHELLE * (0.85 + 0.15 * fact_volume)
     actifs = capital * 5.6
     # Décomposition du capital par catégorie de coussin (poids constants, hypothèse)
     capital_coussins = POIDS_COUSSINS[:, None] * capital[None, :]        # (6 x années)
-    # Cost module : rétro-allocation des 3 blocs vers les 8 catégories avant allocation
-    couts_blocs = np.vstack([acq, attr, na])                              # (3 x années)
-    couts_avant = ALLOC_BLOCS_VERS_CATEGORIES.T @ couts_blocs             # (8 x années)
     # Accrétion des passifs LINÉAIRE : plus de « boom » 2025 -> trajectoire lisse,
     # calibrée pour un RSI ~25 % qui glisse doucement vers ~22 %.
     accretion_passifs = np.linspace(30.0, 49.0, N) * ECHELLE
@@ -257,7 +289,8 @@ PARAMS_BASE = dict(fact_volume=1.0, croiss_fam=[0.0] * len(PRODUITS),
                    parts_canal=[0.60, 0.25, 0.15],
                    rendement=rendement_pondere(RDT_CLASSES_DEFAUT),   # ≈ 3,51 %
                    rdt_classes=list(RDT_CLASSES_DEFAUT),
-                   g_acq=0.035, g_attr=0.030, g_na=0.020)
+                   g_acq=0.035, g_attr=0.030, g_na=0.020,
+                   croiss_categories=[round(float(g), 4) for g in CROISS_CATEGORIES_DEFAUT])
 
 def construire_lignes(res, params, scenario_id):
     """Prépare les lignes overlay / forecast / kpi / dim (mêmes formats que Phase 1)."""
@@ -318,6 +351,12 @@ def construire_lignes(res, params, scenario_id):
             (c, res["couts_avant"][i]) for i, c in enumerate(CATEGORIES_COUTS)
         ],
     }
+    # Levier E pré-allocation : une ligne d'overlay par catégorie/VP (si fourni)
+    if params.get("croiss_categories"):
+        for i, cat in enumerate(CATEGORIES_COUTS):
+            overlay.append((scenario_id, f"E_croiss_{cat}",
+                            float(params["croiss_categories"][i]) / 100.0,
+                            float(CROISS_CATEGORIES_DEFAUT[i]) / 100.0, horo))
     # Levier D granularisé : une ligne d'overlay par classe d'actifs (si fourni)
     if params.get("rdt_classes"):
         for i, cl in enumerate(CLASSES_ACTIFS):
@@ -366,8 +405,8 @@ def construire_lignes(res, params, scenario_id):
             params["g_attr"], params["g_na"])]
     return overlay, forecast, kpi, dim
 
-def generer_faits_saillants(res, res_base, params, jf, annee_focus, scenario_id):
-    """Faits saillants générés automatiquement à partir des résultats (règles métier).
+def generer_faits_par_onglet(res, res_base, params, jf, annee_focus, scenario_id):
+    """Faits saillants générés automatiquement, organisés PAR ONGLET de l'app.
     Alternative légère et 100 % fiable en démo à un Genie embarqué."""
     faits = []
 
@@ -380,8 +419,12 @@ def generer_faits_saillants(res, res_base, params, jf, annee_focus, scenario_id)
                                 abs(params["parts_canal"][1] - 0.25),
                                 abs(params["parts_canal"][2] - 0.15)) / 0.05,
         "le rendement de placement (D)": abs(params["rendement"] - 0.035) / 0.0025,
-        "les dépenses (E)": max(abs(params["g_acq"] - 0.035), abs(params["g_attr"] - 0.030),
-                                abs(params["g_na"] - 0.020)) / 0.005,
+        "les coûts pré-allocation (E)": (
+            max(abs(params["croiss_categories"][i] - CROISS_CATEGORIES_DEFAUT[i])
+                for i in range(len(CATEGORIES_COUTS))) / 0.5
+            if params.get("croiss_categories") else
+            max(abs(params["g_acq"] - 0.035), abs(params["g_attr"] - 0.030),
+                abs(params["g_na"] - 0.020)) / 0.005),
     }
     levier_dom = max(ecarts_lev, key=ecarts_lev.get)
     if max(ecarts_lev.values()) < 0.01:
@@ -419,8 +462,47 @@ def generer_faits_saillants(res, res_base, params, jf, annee_focus, scenario_id)
                  f"({'+' if d_csm >= 0 else ''}{fmt_fr(d_csm / res['csm_open'][0] * 100, 1)} %).")
     d_cpp = res["cout_par_police"][-1] - res["cout_par_police"][0]
     tendance = "baisse" if d_cpp < 0 else "hausse"
-    faits.append(f"💰 Coût d'acquisition moyen par police en **{tendance}** : "
-                 f"{fmt_fr(res['cout_par_police'][0])} $ → "
-                 f"{fmt_fr(res['cout_par_police'][-1])} $ "
-                 f"(effet volume vs croissance des dépenses).")
-    return faits
+    fait_cpp = (f"💰 Coût d'acquisition moyen par police en **{tendance}** : "
+                f"{fmt_fr(res['cout_par_police'][0])} $ → "
+                f"{fmt_fr(res['cout_par_police'][-1])} $ "
+                f"(effet volume vs croissance des dépenses).")
+
+    # ---- Faits dédiés : Capital ----------------------------------------------------
+    cc = res["capital_coussins"]
+    i_dom = int(np.argmax(POIDS_COUSSINS))
+    d_capital = res["capital"][-1] - res["capital"][0]
+    faits_capital = [
+        f"🏛️ Coussin dominant : **{COUSSINS[i_dom]}** à {fmt_m(cc[i_dom][jf])} "
+        f"({POIDS_COUSSINS[i_dom]*100:.0f} % du capital net) en {annee_focus} ; la "
+        f"diversification réduit le besoin de {fmt_m(abs(cc[-1][jf]))}.",
+        f"📊 Capital net à rémunérer : {fmt_m(res['capital'][0])} → "
+        f"{fmt_m(res['capital'][-1])} sur l'horizon "
+        f"({'+' if d_capital >= 0 else ''}{fmt_fr(d_capital / res['capital'][0] * 100, 1)} %).",
+    ]
+
+    # ---- Faits dédiés : Coûts (pré-allocation / VP) ---------------------------------
+    ca = res["couts_avant"]
+    i_gros = int(np.argmax(ca[:, jf]))
+    faits_couts = [fait_cpp,
+                   f"🏢 Plus grosse enveloppe pré-allocation en {annee_focus} : "
+                   f"**{CATEGORIES_COUTS[i_gros]}** ({VP_CATEGORIES[i_gros]}) à "
+                   f"{fmt_m(ca[i_gros][jf], 1)}."]
+    if params.get("croiss_categories"):
+        g = np.asarray(params["croiss_categories"], dtype=float)
+        i_rapide = int(np.argmax(g))
+        faits_couts.append(
+            f"📈 Catégorie à plus forte croissance : **{CATEGORIES_COUTS[i_rapide]}** "
+            f"({VP_CATEGORIES[i_rapide]}) à {fmt_fr(g[i_rapide], 1)} %/an — se propage "
+            f"aux blocs post-allocation et au RSI.")
+
+    return {
+        "tableau_de_bord": faits[:3],
+        "capital": faits_capital,
+        "couts": faits_couts,
+        "csm": [faits[3]],
+    }
+
+def generer_faits_saillants(res, res_base, params, jf, annee_focus, scenario_id):
+    """Compatibilité (notebook) : liste à plat de tous les faits."""
+    d = generer_faits_par_onglet(res, res_base, params, jf, annee_focus, scenario_id)
+    return d["tableau_de_bord"] + d["csm"] + d["capital"] + d["couts"]

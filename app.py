@@ -46,7 +46,23 @@ from moteur_plan import (
     COUSSINS, POIDS_COUSSINS, CATEGORIES_COUTS, ALLOC_BLOCS_VERS_CATEGORIES,
     BLOCS_COUTS, CLASSES_ACTIFS, POIDS_ACTIFS, RDT_CLASSES_DEFAUT,
     rendement_pondere, ORACLE_MAPPING, MOIS, PROFILS_MENSUELS, mensualiser,
+    VP_CATEGORIES, CAT_BASE_2025, ALLOC_CATEGORIES_VERS_BLOCS,
+    CROISS_CATEGORIES_DEFAUT, generer_faits_par_onglet,
 )
+
+def etiqueter_points(ax, xs, ys, dec=0, couleur="#333333", dy=6):
+    """Étiquettes de données sur une série de points (lignes/marqueurs)."""
+    for x, y in zip(xs, ys):
+        ax.annotate(fmt_fr(float(y), dec), (x, float(y)), textcoords="offset points",
+                    xytext=(0, dy), ha="center", fontsize=8, color=couleur,
+                    fontweight="bold")
+
+def etiqueter_totaux(ax, xs, totaux, dec=0):
+    """Étiquettes de total au sommet de barres empilées."""
+    for x, t in zip(xs, totaux):
+        ax.annotate(fmt_fr(float(t), dec), (x, float(t)), textcoords="offset points",
+                    xytext=(0, 4), ha="center", fontsize=8.5, fontweight="bold",
+                    color="#333333")
 
 plt.rcParams.update({
     "figure.facecolor": "white", "axes.facecolor": COUL["fond"],
@@ -242,6 +258,8 @@ def fig_trajectoires(res, res_base, scenario_id):
                 linestyle="--", label="Base")
         ax.plot(ANNEES, res[cle], marker="o", linewidth=2.5, color=COUL["vert"],
                 label=scenario_id)
+        etiqueter_points(ax, ANNEES, res[cle],
+                         dec=1 if "RSI" in titre else 0, couleur=COUL["vert"])
         ax.set_title(titre)
         ax.set_xticks(ANNEES)
         ax.tick_params(labelsize=9)
@@ -308,7 +326,8 @@ FAMILLES_COURTES = ["VE participation", "VE paiements limités", "Autres VE",
                     "Temporaires", "Maladies graves", "Autres inv. et maladie"]
 CLES_B = [f"k_b_{i}" for i in range(len(PRODUITS))]
 CLES_DEFAUTS = {"k_scen": "Base", "k_vol": 1.00, "k_ind": 60, "k_dsj": 25, "k_agt": 15,
-                "k_gacq": 3.5, "k_gattr": 3.0, "k_gna": 2.0,
+                **{f"k_e_{i}": round(float(CROISS_CATEGORIES_DEFAUT[i]), 1)
+                   for i in range(len(CATEGORIES_COUTS))},
                 **{f"k_rc_{i}": RDT_CLASSES_DEFAUT[i] for i in range(len(CLASSES_ACTIFS))},
                 **{c: 0.0 for c in CLES_B}}
 for cle, defaut in CLES_DEFAUTS.items():
@@ -347,14 +366,22 @@ with st.sidebar.expander("D — Rendement par classe d'actifs (%)", expanded=Fal
     rendement = rendement_pondere(rdt_classes)
     st.caption(f"Rendement global pondéré : **{rendement*100:.2f} %**")
 
-with st.sidebar.expander("E — Croissance des dépenses (%/an)", expanded=False):
-    g_acq = st.slider("Coûts d'acquisition", 0.0, 8.0, step=0.1, key="k_gacq") / 100.0
-    g_attr = st.slider("Coûts attribuables", 0.0, 8.0, step=0.1, key="k_gattr") / 100.0
-    g_na = st.slider("Coûts non attribuables", 0.0, 8.0, step=0.1, key="k_gna") / 100.0
+with st.sidebar.expander("E — Coûts pré-allocation par VP (%/an)", expanded=False):
+    st.caption("La croissance de chaque enveloppe VP se propage aux blocs "
+               "post-allocation, aux dépenses du P&L et au RSI.")
+    croiss_cats = [st.slider(f"{CATEGORIES_COUTS[i]} · {VP_CATEGORIES[i]}",
+                             0.0, 8.0, step=0.1, key=f"k_e_{i}")
+                   for i in range(len(CATEGORIES_COUTS))]
+# Taux de blocs post-allocation DÉRIVÉS (traçabilité dim_scenario_gld)
+_cat30 = CAT_BASE_2025 * (1 + np.array(croiss_cats) / 100.0) ** 5
+_b25 = ALLOC_CATEGORIES_VERS_BLOCS.T @ CAT_BASE_2025
+_b30 = ALLOC_CATEGORIES_VERS_BLOCS.T @ _cat30
+g_acq, g_attr, g_na = ((_b30 / _b25) ** (1 / 5) - 1).tolist()
 
 params = dict(fact_volume=float(fact_volume), croiss_fam=[float(c) for c in croiss_fam],
               parts_canal=[float(p) for p in parts_canal], rendement=float(rendement),
               rdt_classes=[float(r) for r in rdt_classes],
+              croiss_categories=[float(c) for c in croiss_cats],
               g_acq=float(g_acq), g_attr=float(g_attr), g_na=float(g_na))
 
 # ---- Recalcul instantané (moment « wow » A) ------------------------------------
@@ -400,10 +427,20 @@ if conn_ok:
                         "k_dsj": int(round(lev.get("C_part_desjardins", 0.25) / total * 100)),
                         "k_agt": int(round(lev.get("C_part_agents", 0.15) / total * 100)),
 
-                        "k_gacq": round(lev.get("E_croiss_couts_acquisition", 0.035) * 100, 1),
-                        "k_gattr": round(lev.get("E_croiss_couts_attribuables", 0.030) * 100, 1),
-                        "k_gna": round(lev.get("E_croiss_couts_non_attrib", 0.020) * 100, 1),
                     }
+                    if any(l.startswith("E_croiss_") and not l.startswith("E_croiss_couts")
+                           for l in lev):
+                        for i, cat in enumerate(CATEGORIES_COUTS):
+                            charge[f"k_e_{i}"] = round(
+                                lev.get(f"E_croiss_{cat}",
+                                        CROISS_CATEGORIES_DEFAUT[i] / 100.0) * 100, 1)
+                    else:   # scénario hérité (3 blocs) : projection sur les catégories
+                        g_b = np.array([lev.get("E_croiss_couts_acquisition", 0.035),
+                                        lev.get("E_croiss_couts_attribuables", 0.030),
+                                        lev.get("E_croiss_couts_non_attrib", 0.020)])
+                        for i in range(len(CATEGORIES_COUTS)):
+                            charge[f"k_e_{i}"] = round(
+                                float(ALLOC_CATEGORIES_VERS_BLOCS[i] @ g_b) * 100, 1)
                     if any(l.startswith("D_rdt_") for l in lev):
                         for i, cl in enumerate(CLASSES_ACTIFS):
                             charge[f"k_rc_{i}"] = round(
@@ -450,26 +487,14 @@ c3.metric("VAN des affaires nouvelles", fmt_m(res["van_tot_m"][jf], 1),
 c4.metric("Solde CSM (fin)", fmt_m(res["csm_close"][jf]),
           delta=fmt_m(res["csm_close"][jf] - res_base["csm_close"][jf]) + " vs Base")
 
-# ---- Sparklines sous les cartes (tendance 2025-2030) ------------------------------
-fig, axes = plt.subplots(1, 4, figsize=(15, 0.9))
-fig.patch.set_alpha(0)
-for ax, (serie, couleur) in zip(axes, [
-    (res["resultat_net"], COUL["vert"]), (res["rsi_global"], COUL["bleu"]),
-    (res["van_tot_m"], COUL["rouge"]), (res["csm_close"], COUL["or"]),
-]):
-    ax.plot(ANNEES, serie, color=couleur, linewidth=1.8)
-    ax.fill_between(ANNEES, serie, serie.min(), color=couleur, alpha=0.12)
-    ax.scatter([ANNEES[jf]], [serie[jf]], color=couleur, s=22, zorder=3)
-    ax.axis("off")
-fig.tight_layout(pad=0.2)
-afficher_fig(fig)
+# ---- 💡 Faits saillants automatisés (calculés une fois, distribués par onglet) -----
+faits_ong = generer_faits_par_onglet(res, res_base, params, jf, annee_focus, scenario_id)
 
-# ---- 💡 Faits saillants automatisés ----------------------------------------------
-with st.container(border=True):
-    st.markdown(f"**💡 Faits saillants — « {scenario_id} » · {annee_focus}** "
-                f"*(générés automatiquement à partir du scénario courant)*")
-    for fait in generer_faits_saillants(res, res_base, params, jf, annee_focus, scenario_id):
-        st.markdown(f"- {fait}")
+def bloc_faits(cle, titre):
+    with st.container(border=True):
+        st.markdown(f"**💡 Faits saillants — {titre}** *(générés du scénario courant)*")
+        for fait in faits_ong[cle]:
+            st.markdown(f"- {fait}")
 
 # ---- Onglets ---------------------------------------------------------------------
 ong1, ong_cap, ong_cout, ong2, ong_mois, ong3, ong4 = st.tabs(
@@ -482,6 +507,7 @@ def valeurs_vue(series_list, jf, cumulatif):
     return [float(np.sum(s[:jf + 1])) if cumulatif else float(s[jf]) for s in series_list]
 
 with ong1:
+    bloc_faits("tableau_de_bord", f"« {scenario_id} » · {annee_focus}")
     vue = st.radio("Vue des waterfalls", ["Annuelle", "Cumulative depuis 2025"],
                    horizontal=True, key="k_vue_src")
     cumul = vue.startswith("Cumulative")
@@ -519,6 +545,8 @@ with ong_cap:
                        label=f"{c} (réduction)", hatch="//", zorder=3)
         ax.plot(ANNEES, res["capital"], marker="o", color="black", linewidth=2.2,
                 label="Capital net à rémunérer", zorder=4)
+        etiqueter_totaux(ax, ANNEES, bas)                       # sommet des coussins bruts
+        etiqueter_points(ax, ANNEES, res["capital"], dy=-14)   # capital net
         ax.axhline(0, color=COUL["gris"], linewidth=0.8)
         ax.set_title("Empilement des coussins et capital net (M$)")
         ax.set_xticks(ANNEES)
@@ -532,14 +560,16 @@ with ong_cap:
             COUSSINS + ["Capital net"], vals_cap,
             f"Composition du capital {annee_focus} (M$)",
             plafond=float(cc[:5, jf].sum()) * 1.2))
+    bloc_faits("capital", "Capital")
     tbl_cap = pd.DataFrame(cc.round(0), index=COUSSINS,
                            columns=[str(a) for a in ANNEES])
     tbl_cap.loc["Capital net à rémunérer"] = res["capital"].round(0)
     st.dataframe(tbl_cap.reset_index(names="Coussin (M$)"), hide_index=True, width="stretch")
 
 with ong_cout:
-    st.markdown(f"**Cost module — rétro-allocation vers les catégories avant allocation** "
-                f"*(« {scenario_id} », piloté par le levier E)*")
+    st.markdown(f"**Cost module — piloté PRÉ-ALLOCATION par enveloppe de VP (levier E)** "
+                f"*(« {scenario_id} » : chaque catégorie croît à son taux, puis "
+                f"s'alloue vers les blocs post-allocation → dépenses du P&L → RSI)*")
     ca = res["couts_avant"]                # (8 catégories x années)
     couleurs_k = ["#1F5673", "#00874E", "#B8860B", "#8E44AD", "#16A085",
                   "#C0392B", "#7F8C8D", "#2C3E50"]
@@ -551,7 +581,8 @@ with ong_cout:
             ax.bar(ANNEES, ca[i], bottom=bas, color=couleurs_k[i], width=0.62,
                    label=c, zorder=3)
             bas += ca[i]
-        ax.set_title("Coûts avant allocation par catégorie (M$)")
+        etiqueter_totaux(ax, ANNEES, ca.sum(axis=0))
+        ax.set_title("Coûts PRÉ-allocation par catégorie / VP (M$) — la source")
         ax.set_xticks(ANNEES)
         ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: fmt_fr(x)))
         ax.legend(fontsize=7.5, ncol=2)
@@ -562,24 +593,32 @@ with ong_cout:
         for k, b in enumerate(BLOCS_COUTS):
             ax.plot(ANNEES, res["couts_blocs"][k], marker="o", linewidth=2.2,
                     color=[COUL["bleu"], COUL["vert"], COUL["or"]][k], label=b)
-        ax.set_title("Blocs post-allocation (M$) — leviers E")
+            etiqueter_points(ax, ANNEES, res["couts_blocs"][k],
+                             couleur=[COUL["bleu"], COUL["vert"], COUL["or"]][k])
+        ax.set_title("Blocs POST-allocation dérivés (M$)")
         ax.set_xticks(ANNEES)
         ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: fmt_fr(x)))
         ax.legend(fontsize=8.5)
         fig.tight_layout()
         afficher_fig(fig)
-    tbl_ca = pd.DataFrame(ca.round(1), index=CATEGORIES_COUTS,
+    bloc_faits("couts", "Coûts")
+    tbl_ca = pd.DataFrame(ca.round(1),
+                          index=[f"{c} — {vp}" for c, vp in
+                                 zip(CATEGORIES_COUTS, VP_CATEGORIES)],
                           columns=[str(a) for a in ANNEES])
     tbl_ca.loc["Total"] = ca.sum(axis=0).round(1)
-    st.dataframe(tbl_ca.reset_index(names="Catégorie (M$)"), hide_index=True, width="stretch")
-    with st.expander("Matrice de rétro-allocation (blocs → catégories, hypothèses)"):
-        mat = pd.DataFrame(ALLOC_BLOCS_VERS_CATEGORIES * 100, index=BLOCS_COUTS,
-                           columns=CATEGORIES_COUTS).round(0).astype(int)
-        st.dataframe(mat.reset_index(names="Bloc \\ Catégorie (%)"),
+    st.dataframe(tbl_ca.reset_index(names="Catégorie — VP responsable (M$)"),
+                 hide_index=True, width="stretch")
+    with st.expander("Matrice d'allocation (catégories → blocs, hypothèses ; lignes = 100 %)"):
+        mat = pd.DataFrame(ALLOC_CATEGORIES_VERS_BLOCS * 100,
+                           index=[f"{c} ({vp})" for c, vp in
+                                  zip(CATEGORIES_COUTS, VP_CATEGORIES)],
+                           columns=BLOCS_COUTS).round(1)
+        st.dataframe(mat.reset_index(names="Catégorie \\ Bloc (%)"),
                      hide_index=True, width="stretch")
 
 with ong2:
-
+    bloc_faits("csm", "Roll-forward CSM")
     vue_csm = st.radio("Vue", ["Annuelle", "Cumulative depuis 2025"],
                        horizontal=True, key="k_vue_csm")
     cumul_csm = vue_csm.startswith("Cumulative")
@@ -634,6 +673,10 @@ with ong_mois:
     ax.set_facecolor("#2B3A4A")
     ax.bar(range(12), mens, color="#8FD98F", width=0.55, zorder=3,
            label=f"{choix_m} — mensuel")
+    for x_b, v_b in enumerate(mens):
+        ax.annotate(fmt_fr(float(v_b), dec_m), (x_b, float(v_b)),
+                    textcoords="offset points", xytext=(0, 4), ha="center",
+                    fontsize=8, color="white", fontweight="bold")
     ax2 = ax.twinx()
     ax2.plot(range(12), cum, color="#F5B041", marker="o", linewidth=2.2,
              label="Cumul depuis janvier", zorder=4)
@@ -697,6 +740,9 @@ with ong3:
                  .sort_values("annee"))
             ax.plot(d["annee"], d["valeur"], marker="o", linewidth=2.3,
                     color=couleurs[s_i % len(couleurs)], label=sc)
+            if len(d):
+                etiqueter_points(ax, [d["annee"].iloc[-1]], [d["valeur"].iloc[-1]],
+                                 dec=1, couleur=couleurs[s_i % len(couleurs)])
         ax.plot(ANNEES, res[cle_local], marker="s", linewidth=2, linestyle=":",
                 color="black", label=f"{scenario_id} (courant)")
         ax.set_title(titre)
