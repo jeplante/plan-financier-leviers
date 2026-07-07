@@ -492,16 +492,21 @@ def bloc_faits(cle, titre):
             st.markdown(f"- {fait}")
 
 # ---- Onglets ---------------------------------------------------------------------
-ong1, ong_cap, ong_cout, ong2, ong_mois, ong3, ong4 = st.tabs(
-    ["📊 Tableau de bord", "🏛️ Capital", "💸 Coûts", "🔁 Roll-forward CSM",
-     "📅 Mensualisation", "⚖️ Comparaison", "📄 Détail"]
-)
+SECTIONS = ["📊 Tableau de bord", "🏛️ Capital", "💸 Coûts",
+            "🔁 Roll-forward CSM", "⚖️ Comparaison", "📄 Détail"]
+st.session_state.setdefault("k_nav", SECTIONS[0])
+nav = st.radio("Navigation", SECTIONS, horizontal=True, key="k_nav",
+               label_visibility="collapsed")
+# Navigation persistante : contrairement à st.tabs, la sélection survit aux reruns
+# déclenchés par les widgets internes (fini le retour au premier onglet), et seule
+# la section active est recalculée.
+st.divider()
 
 def valeurs_vue(series_list, jf, cumulatif):
     """Vue annuelle (valeur de l'année focus) ou cumulative (somme 2025 -> focus)."""
     return [float(np.sum(s[:jf + 1])) if cumulatif else float(s[jf]) for s in series_list]
 
-with ong1:
+if nav == "📊 Tableau de bord":
     bloc_faits("tableau_de_bord", f"« {scenario_id} » · {annee_focus}")
     vue = st.radio("Vue des waterfalls", ["Annuelle", "Cumulative depuis 2025"],
                    horizontal=True, key="k_vue_src")
@@ -521,7 +526,8 @@ with ong1:
         afficher_fig(fig_heatmap(res["rsi_adj"], rendement, scenario_id))
     afficher_fig(fig_trajectoires(res, res_base, scenario_id))
 
-with ong_cap:
+if nav == "🏛️ Capital":
+    bloc_faits("capital", "Capital")
     st.markdown(f"**Capital requis par catégorie de coussin — « {scenario_id} »** "
                 "*(poids par coussin : hypothèses de démonstration)*")
     cc = res["capital_coussins"]           # (6 coussins x années), Diversification < 0
@@ -579,13 +585,13 @@ with ong_cap:
     ax.legend(fontsize=9)
     fig.tight_layout()
     afficher_fig(fig)
-    bloc_faits("capital", "Capital")
     tbl_cap = pd.DataFrame(cc.round(0), index=COUSSINS,
                            columns=[str(a) for a in ANNEES])
     tbl_cap.loc["Capital net à rémunérer"] = res["capital"].round(0)
     st.dataframe(tbl_cap.reset_index(names="Coussin (M$)"), hide_index=True, width="stretch")
 
-with ong_cout:
+if nav == "💸 Coûts":
+    bloc_faits("couts", "Coûts")
     st.markdown(f"**Cost module — piloté PRÉ-ALLOCATION par enveloppe de VP (levier E)** "
                 f"*(« {scenario_id} » : chaque catégorie croît à son taux, puis "
                 f"s'alloue vers les blocs post-allocation → dépenses du P&L → RSI)*")
@@ -620,7 +626,6 @@ with ong_cout:
         ax.legend(fontsize=8.5)
         fig.tight_layout()
         afficher_fig(fig)
-    bloc_faits("couts", "Coûts")
     tbl_ca = pd.DataFrame(ca.round(1),
                           index=[f"{c} — {vp}" for c, vp in
                                  zip(CATEGORIES_COUTS, VP_CATEGORIES)],
@@ -636,7 +641,7 @@ with ong_cout:
         st.dataframe(mat.reset_index(names="Catégorie \\ Bloc (%)"),
                      hide_index=True, width="stretch")
 
-with ong2:
+if nav == "🔁 Roll-forward CSM":
     bloc_faits("csm", "Roll-forward CSM")
     vue_csm = st.radio("Vue", ["Annuelle", "Cumulative depuis 2025"],
                        horizontal=True, key="k_vue_csm")
@@ -675,98 +680,7 @@ with ong2:
         "Solde fin (M$)": res["csm_close"].round(0),
     }), hide_index=True, width="stretch")
 
-with ong_mois:
-    st.markdown(f"**Mensualisation exploratoire — « {scenario_id} »** "
-                "*(profils de saisonnalité : hypothèses ajustables ; non persisté au Gold)*")
-    c_sel1, c_sel2, c_sel3, c_sel4 = st.columns([1, 1.6, 1.6, 1.2])
-    annee_m = c_sel1.selectbox("Année", ANNEES, index=len(ANNEES) - 1, key="k_m_annee")
-    jm = ANNEES.index(annee_m)
-    series_m = {
-        "Ventes totales (K$)": (res["ventes_scen"].sum(axis=0),
-                                "Saisonnalité ventes (REER + automne)", 0),
-        "Résultat d'exploitation (M$)": (res["exploitation"],
-                                         "Saisonnalité ventes (REER + automne)", 1),
-        "Résultat net (M$)": (res["resultat_net"],
-                              "Saisonnalité ventes (REER + automne)", 1),
-        "Coûts totaux (M$)": (res["couts_blocs"].sum(axis=0),
-                              "Charge de fin d'année (coûts)", 1),
-    }
-    choix_m = c_sel2.selectbox("Ligne à mensualiser", list(series_m.keys()), key="k_m_serie")
-    serie_ann, profil_defaut, dec_m = series_m[choix_m]
-    options_profils = list(PROFILS_MENSUELS.keys()) + ["Personnalisé (saisie par mois)"]
-    profil_m = c_sel3.selectbox("Profil de saisonnalité", options_profils,
-                                index=options_profils.index(profil_defaut),
-                                key="k_m_profil")
-    if profil_m.startswith("Personnalisé"):
-        c_sel4.caption("Intensité : n/a (saisie directe)")
-        desc_profil = "profil personnalisé (saisie par mois)"
-        st.markdown("**Poids mensuels (%)** — saisis librement, renormalisés à 100 % :")
-        defaut_pers = pd.DataFrame(
-            {m: [round(float(p * 100), 1)] for m, p in
-             zip(MOIS, PROFILS_MENSUELS["Saisonnalité ventes (REER + automne)"])})
-        saisie = st.data_editor(defaut_pers, hide_index=True, width="stretch",
-                                key="k_m_saisie", num_rows="fixed")
-        poids_pers = np.clip(saisie.iloc[0].to_numpy(dtype=float), 0.0, None)
-        if poids_pers.sum() <= 0:
-            poids_pers = np.full(12, 1.0)
-        poids_pers = poids_pers / poids_pers.sum()
-        st.caption("Somme saisie : " + fmt_fr(float(saisie.iloc[0].sum()), 1, " %")
-                   + " → renormalisée à 100 %.")
-        mens = float(serie_ann[jm]) * poids_pers
-    else:
-        intensite = c_sel4.slider("Intensité du profil", 0.0, 1.0, 1.0, 0.05, key="k_m_int")
-        desc_profil = f"profil « {profil_m} » (intensité {intensite:.0%})"
-        mens = mensualiser(serie_ann[jm], profil_m, intensite)
-    cum = np.cumsum(mens)
-
-    # Panneau sombre à barres vertes + ligne de cumul (inspiré du visuel fourni)
-    fig, ax = plt.subplots(figsize=(12.5, 4.4))
-    fig.patch.set_facecolor("#2B3A4A")
-    ax.set_facecolor("#2B3A4A")
-    ax.bar(range(12), mens, color="#8FD98F", width=0.55, zorder=3,
-           label=f"{choix_m} — mensuel")
-    for x_b, v_b in enumerate(mens):
-        ax.annotate(fmt_fr(float(v_b), dec_m), (x_b, float(v_b)),
-                    textcoords="offset points", xytext=(0, 4), ha="center",
-                    fontsize=8, color="white", fontweight="bold")
-    ax2 = ax.twinx()
-    ax2.plot(range(12), cum, color="#F5B041", marker="o", linewidth=2.2,
-             label="Cumul depuis janvier", zorder=4)
-    for a in (ax, ax2):
-        a.grid(False)
-        for cote in a.spines.values():
-            cote.set_visible(False)
-        a.tick_params(colors="white", labelsize=9.5)
-    ax.set_xticks(range(12), MOIS)
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: fmt_fr(x, dec_m)))
-    ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: fmt_fr(x, dec_m)))
-    ax.set_title(f"{choix_m} — {annee_m} · {desc_profil} · scénario « {scenario_id} »",
-                 color="white", fontsize=12.5, fontweight="bold")
-    l1, e1 = ax.get_legend_handles_labels()
-    l2, e2 = ax2.get_legend_handles_labels()
-    ax.legend(l1 + l2, e1 + e2, fontsize=9, facecolor="#2B3A4A",
-              labelcolor="white", edgecolor="#44576B")
-    fig.tight_layout()
-    afficher_fig(fig)
-
-    tbl_m = pd.DataFrame({"Mois": MOIS, choix_m: np.round(mens, dec_m),
-                          "Cumul": np.round(cum, dec_m),
-                          "Poids (%)": np.round(mens / mens.sum() * 100, 1)})
-    cg, cd = st.columns([1.4, 1])
-    cg.dataframe(tbl_m, hide_index=True, width="stretch")
-    with cd:
-        st.metric(f"Total {annee_m}", fmt_fr(float(serie_ann[jm]), dec_m))
-        pointe = int(np.argmax(mens))
-        st.metric("Mois de pointe", MOIS[pointe],
-                  delta=f"{mens[pointe] / mens.sum() * 100:.1f} % de l'année")
-        st.download_button("⬇️ Télécharger (CSV)",
-                           tbl_m.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
-                           file_name=f"mensualisation_{scenario_id}_{annee_m}.csv",
-                           mime="text/csv", key="k_m_dl")
-    st.caption("💡 Prochaine itération possible : persister la vue mensuelle par scénario "
-               "dans une table Gold (`forecast_mensuel_gld`) pour Genie et Power BI.")
-
-with ong3:
+if nav == "⚖️ Comparaison":
     st.markdown(f"**Explication de l'écart vs « Base » par levier — résultat net "
                 f"{annee_focus} (M$)**")
     options_attr = ["Scénario courant (curseurs)"]
@@ -841,7 +755,7 @@ with ong3:
     elif conn_ok:
         st.info("Aucun scénario écrit pour l'instant : utiliser 💾 dans la barre latérale.")
 
-with ong4:
+if nav == "📄 Détail":
     st.markdown(f"**État des résultats IFRS 17 — « {scenario_id} » (M$)**")
     pnl = pd.DataFrame({
         "Ligne": ["Produits d'assurance", "Charges d'assurance", "Réassurance nette",
@@ -860,6 +774,14 @@ with ong4:
     ventes_df = pd.DataFrame(res["ventes_scen"].round(0), index=PRODUITS,
                              columns=[str(a) for a in ANNEES]).reset_index(names="Produit")
     st.dataframe(ventes_df, hide_index=True, width="stretch")
+
+    st.markdown(f"**Split par réseau de distribution — {annee_focus} (K$)** "
+                f"*(mix canal du scénario : levier C)*")
+    split_df = pd.DataFrame(res["ventes_pc"][:, jf, :].round(0),
+                            index=PRODUITS, columns=CANAUX)
+    split_df["Total"] = split_df.sum(axis=1)
+    split_df.loc["Total"] = split_df.sum(axis=0)
+    st.dataframe(split_df.reset_index(names="Produit"), hide_index=True, width="stretch")
 
     st.markdown("**Correspondance dimensions FP → Oracle EPM** "
                 "*(format d'export : Account · Entity · Scenario · Version · Period · Year · LOB · Amount)*")
