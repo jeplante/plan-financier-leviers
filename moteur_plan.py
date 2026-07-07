@@ -177,14 +177,21 @@ VENTES_BASE = ventes_baseline()
 
 def calculer_scenario(scenario_id, fact_volume, croiss_fam, parts_canal,
                       rendement, g_acq, g_attr, g_na, rdt_classes=None,
-                      croiss_categories=None, facteur_capital=1.0):
+                      croiss_categories=None, facteur_capital=1.0,
+                      choc_taux_pb=0.0, choc_mortalite=0.0,
+                      choc_decheance=0.0, choc_morbidite=0.0):
     """croiss_fam : ajustement de croissance PAR FAMILLE, en points de %/an vs le plan
     (ex. +2.0 -> la famille croît 2 pts plus vite chaque année que sa trajectoire de base).
     rdt_classes : rendements par classe d'actifs (%) — informatif ; le calcul utilise
     `rendement` (déjà pondéré via rendement_pondere), les classes sont tracées en overlay.
     croiss_categories : croissances PRÉ-ALLOCATION par catégorie/VP (%/an). Si fourni,
     les 8 catégories sont la SOURCE et les blocs post-allocation en découlent ;
-    sinon (mode hérité, notebook), les blocs sont pilotés par g_acq/g_attr/g_na."""
+    sinon (mode hérité, notebook), les blocs sont pilotés par g_acq/g_attr/g_na.
+    choc_taux_pb : choc de taux en points de base. L'ALM adosse ~90 %% du résultat
+    financier ; la hausse bonifie toutefois les produits PERMANENTS la 1re année
+    (VAN, CSM des ventes, RSI), puis le repricing de l'industrie normalise.
+    choc_mortalite / choc_decheance / choc_morbidite : écart réel vs hypothèses en %%
+    (positif = DÉFAVORABLE) -> Expérience du P&L + Changements d'hypothèses du CSM."""
     t_idx = np.arange(N)
     rsi_mat = RSI_MATRICE.to_numpy()
 
@@ -196,7 +203,11 @@ def calculer_scenario(scenario_id, fact_volume, croiss_fam, parts_canal,
     ventes_tot_m = ventes_scen.sum(axis=0) / 1000.0
     ventes_pc = ventes_scen[:, :, None] * np.array(parts_canal)[None, None, :]
 
+    boost_taux = choc_taux_pb / 10000.0            # choc en fraction
+    IDX_PERM = [0, 1, 2]                            # familles permanentes (vie entière)
     rsi_adj = rsi_mat + (rendement - 0.035) * 100 * 0.8
+    # G — 1re année : la hausse de taux bonifie le RSI des permanents (avant repricing)
+    rsi_adj[IDX_PERM, :] = rsi_adj[IDX_PERM, :] + boost_taux * 100 * 0.8
     masque = ~np.isnan(rsi_mat)
     rsi_nb = np.array([
         np.nansum(np.where(masque, rsi_adj, 0) * ventes_pc[:, j, :]) /
@@ -205,12 +216,19 @@ def calculer_scenario(scenario_id, fact_volume, croiss_fam, parts_canal,
     ])
 
     van_k = MARGE_VAN[:, None] * ventes_scen + ventes_scen * (rendement - 0.035) * 2.0
+    # G — VAN des permanents bonifiée la 1re année seulement (repricing ensuite)
+    van_k[IDX_PERM, 0] = van_k[IDX_PERM, 0] + ventes_scen[IDX_PERM, 0] * boost_taux * 3.0
     van_tot_m = van_k.sum(axis=0) / 1000.0
 
     marge_csm = np.linspace(0.75, 1.03, N)
-    nb_csm = marge_csm * ventes_tot_m                      # ventes déjà à l'échelle
+    nb_csm = marge_csm * ventes_tot_m
+    part_perm = ventes_scen[IDX_PERM, 0].sum() / max(1e-9, ventes_scen[:, 0].sum())
+    nb_csm[0] = nb_csm[0] * (1 + boost_taux * 4.0 * part_perm)   # G — 1re année                      # ventes déjà à l'échelle
     # Changements d'hypothèses lissés (plus de choc -37 en 2025 -> trajectoire douce)
     chg_hyp = np.array([-12, -8, -4, 0, 6, 12], dtype=float) * ECHELLE
+    # H — renforcement d'hypothèses si l'expérience est défavorable (persistant)
+    chg_hyp = chg_hyp - (0.90 * choc_mortalite + 1.10 * choc_morbidite
+                         + 1.30 * choc_decheance) * ECHELLE
     exp_csm = 12.0 * ECHELLE
     csm_open, csm_close, csm_release, csm_interet = [], [], [], []
     solde = 1937.0 * ECHELLE
@@ -227,7 +245,9 @@ def calculer_scenario(scenario_id, fact_volume, croiss_fam, parts_canal,
     ra_release = 31.0 * ECHELLE * 1.05 ** t_idx
     profit_attendu = csm_release + ra_release
     impact_ventes = 0.11 * van_tot_m
-    experience = (15.0 + 1.5 * t_idx) * ECHELLE
+    experience = ((15.0 + 1.5 * t_idx)
+                  - (0.40 * choc_mortalite + 0.55 * choc_morbidite
+                     + 0.15 * choc_decheance)) * ECHELLE
 
     if croiss_categories is not None:
         # Modèle piloté PRÉ-ALLOCATION : chaque catégorie (VP) croît à son taux,
@@ -256,7 +276,9 @@ def calculer_scenario(scenario_id, fact_volume, croiss_fam, parts_canal,
     # Accrétion des passifs LINÉAIRE : plus de « boom » 2025 -> trajectoire lisse,
     # calibrée pour un RSI ~25 % qui glisse doucement vers ~22 %.
     accretion_passifs = np.linspace(30.0, 49.0, N) * ECHELLE
-    interet_marche = actifs * rendement - accretion_passifs
+    # G — ALM : ~90 % du bilan est adossé ; seul un résidu (~10 %) réagit au choc
+    interet_marche = (actifs * rendement - accretion_passifs
+                      + actifs * boost_taux * 0.10)
 
     activites = profit_attendu + impact_ventes + experience
     exploitation = activites + interet_marche + depenses_src
@@ -295,7 +317,9 @@ PARAMS_BASE = dict(fact_volume=1.0, croiss_fam=[0.0] * len(PRODUITS),
                    rdt_classes=list(RDT_CLASSES_DEFAUT),
                    g_acq=0.035, g_attr=0.030, g_na=0.020,
                    croiss_categories=[round(float(g), 4) for g in CROISS_CATEGORIES_DEFAUT],
-                   facteur_capital=1.0)
+                   facteur_capital=1.0,
+                   choc_taux_pb=0.0, choc_mortalite=0.0,
+                   choc_decheance=0.0, choc_morbidite=0.0)
 
 def construire_lignes(res, params, scenario_id):
     """Prépare les lignes overlay / forecast / kpi / dim (mêmes formats que Phase 1)."""
@@ -356,6 +380,11 @@ def construire_lignes(res, params, scenario_id):
             (c, res["couts_avant"][i]) for i, c in enumerate(CATEGORIES_COUTS)
         ],
     }
+    for nom_l, cle_l in [("G_choc_taux_pb", "choc_taux_pb"),
+                         ("H_choc_mortalite", "choc_mortalite"),
+                         ("H_choc_decheance", "choc_decheance"),
+                         ("H_choc_morbidite", "choc_morbidite")]:
+        overlay.append((scenario_id, nom_l, float(params.get(cle_l, 0.0)), 0.0, horo))
     overlay.append((scenario_id, "F_facteur_capital",
                     float(params.get("facteur_capital", 1.0)), 1.00, horo))
     # Levier E pré-allocation : une ligne d'overlay par catégorie/VP (si fourni)
@@ -416,11 +445,14 @@ def construire_lignes(res, params, scenario_id):
 # Des « réels » synthétiques divergent progressivement du plan ; à chaque date de
 # coupure, l'information accumulée croît -> l'ajustement des leviers implicites aussi.
 # Principe démontré : rolling forecast = baseline immuable + NOUVEL overlay recalibré.
-COUPURES_RF = {
-    "Fin 2025":  {"intensite": 0.50, "annee_x": 2025.92},
-    "Mi-2026":   {"intensite": 0.75, "annee_x": 2026.50},
-    "Fin 2026":  {"intensite": 1.00, "annee_x": 2026.92},
-}
+# Coupure mensuelle : l'information accumulée (et donc la recalibration des leviers)
+# croît linéairement de Déc 2025 (0,50) à Déc 2026 (1,00).
+COUPURES_RF = {"Déc 2025": {"intensite": 0.50, "annee_x": 2025.96}}
+for _m in range(1, 13):
+    COUPURES_RF[f"{MOIS[_m - 1]} 2026"] = {
+        "intensite": round(0.50 + 0.50 * _m / 12, 3),
+        "annee_x": round(2026.0 + _m / 12 - 0.02, 3),
+    }
 NARRATIF_RF = ("Les réels montrent : ventes sous le plan (pression concurrentielle sur "
                "les temporaires), coûts TI et Distribution au-dessus (projets de "
                "modernisation), rendement des actions au-dessus (marchés favorables).")
@@ -444,6 +476,8 @@ GROUPES_LEVIERS = [
     ("D · Rendement", ["rendement", "rdt_classes"]),
     ("E · Coûts VP", ["croiss_categories", "g_acq", "g_attr", "g_na"]),
     ("F · Capital", ["facteur_capital"]),
+    ("G · Taux (ALM)", ["choc_taux_pb"]),
+    ("H · Hyp. actuarielles", ["choc_mortalite", "choc_decheance", "choc_morbidite"]),
 ]
 
 def attribution_par_levier(params_cible, jf, params_base=None):
@@ -495,6 +529,10 @@ def overlay_vers_params(lev):
         croiss_categories=[float(x) for x in cc],
         g_acq=0.035, g_attr=0.030, g_na=0.020,
         facteur_capital=float(lev.get("F_facteur_capital", 1.0)),
+        choc_taux_pb=float(lev.get("G_choc_taux_pb", 0.0)),
+        choc_mortalite=float(lev.get("H_choc_mortalite", 0.0)),
+        choc_decheance=float(lev.get("H_choc_decheance", 0.0)),
+        choc_morbidite=float(lev.get("H_choc_morbidite", 0.0)),
     )
 
 def generer_faits_par_onglet(res, res_base, params, jf, annee_focus, scenario_id):
@@ -512,6 +550,10 @@ def generer_faits_par_onglet(res, res_base, params, jf, annee_focus, scenario_id
                                 abs(params["parts_canal"][2] - 0.15)) / 0.05,
         "le rendement de placement (D)": abs(params["rendement"] - 0.035) / 0.0025,
         "l'optimisation du capital (F)": abs(params.get("facteur_capital", 1.0) - 1.0) / 0.02,
+        "le choc de taux (G)": abs(params.get("choc_taux_pb", 0.0)) / 25.0,
+        "les hypothèses actuarielles (H)": max(
+            abs(params.get("choc_mortalite", 0.0)), abs(params.get("choc_decheance", 0.0)),
+            abs(params.get("choc_morbidite", 0.0))) / 2.0,
         "les coûts pré-allocation (E)": (
             max(abs(params["croiss_categories"][i] - CROISS_CATEGORIES_DEFAUT[i])
                 for i in range(len(CATEGORIES_COUTS))) / 0.5

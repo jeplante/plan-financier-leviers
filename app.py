@@ -314,7 +314,7 @@ FAMILLES_COURTES = ["VE participation", "VE paiements limités", "Autres VE",
                     "Temporaires", "Maladies graves", "Autres inv. et maladie"]
 CLES_B = [f"k_b_{i}" for i in range(len(PRODUITS))]
 CLES_DEFAUTS = {"k_scen": "Base", "k_vol": 1.00, "k_ind": 60, "k_dsj": 25, "k_agt": 15,
-                "k_cap": 1.00,
+                "k_cap": 1.00, "k_taux": 0, "k_mort": 0.0, "k_lapse": 0.0, "k_morb": 0.0,
                 **{f"k_e_{i}": round(float(CROISS_CATEGORIES_DEFAUT[i]), 1)
                    for i in range(len(CATEGORIES_COUTS))},
                 **{f"k_rc_{i}": RDT_CLASSES_DEFAUT[i] for i in range(len(CLASSES_ACTIFS))},
@@ -366,6 +366,19 @@ facteur_capital = st.sidebar.slider("F — Optimisation du capital (×)", 0.80, 
                                     help="Réassurance, ALM, redéploiement : réduit le "
                                          "capital à rémunérer et ses coussins (le RSI "
                                          "monte, le résultat financier baisse un peu).")
+with st.sidebar.expander("G / H — Taux et hypothèses actuarielles", expanded=False):
+    choc_taux_pb = st.slider("G — Choc de taux (points de base)", -100, 100, step=5,
+                             key="k_taux",
+                             help="L'ALM adosse ~90 % du résultat financier. Une hausse "
+                                  "bonifie toutefois les produits PERMANENTS la 1re "
+                                  "année (VAN, CSM des ventes, RSI), puis le repricing "
+                                  "de l'industrie normalise.")
+    st.caption("Chocs d'expérience vs hypothèses (**positif = défavorable**) — "
+               "alimentent l'Expérience du P&L et les Changements d'hypothèses du CSM :")
+    choc_mortalite = st.slider("H — Mortalité (%)", -10.0, 10.0, step=0.5, key="k_mort")
+    choc_decheance = st.slider("H — Déchéance (%)", -10.0, 10.0, step=0.5, key="k_lapse")
+    choc_morbidite = st.slider("H — Morbidité (%)", -10.0, 10.0, step=0.5, key="k_morb")
+
 # Taux de blocs post-allocation DÉRIVÉS (traçabilité dim_scenario_gld)
 _cat30 = CAT_BASE_2025 * (1 + np.array(croiss_cats) / 100.0) ** 5
 _b25 = ALLOC_CATEGORIES_VERS_BLOCS.T @ CAT_BASE_2025
@@ -377,6 +390,8 @@ params = dict(fact_volume=float(fact_volume), croiss_fam=[float(c) for c in croi
               rdt_classes=[float(r) for r in rdt_classes],
               croiss_categories=[float(c) for c in croiss_cats],
               facteur_capital=float(facteur_capital),
+              choc_taux_pb=float(choc_taux_pb), choc_mortalite=float(choc_mortalite),
+              choc_decheance=float(choc_decheance), choc_morbidite=float(choc_morbidite),
               g_acq=float(g_acq), g_attr=float(g_attr), g_na=float(g_na))
 
 # ---- Recalcul instantané (moment « wow » A) ------------------------------------
@@ -422,6 +437,10 @@ if conn_ok:
                         "k_dsj": int(round(lev.get("C_part_desjardins", 0.25) / total * 100)),
                         "k_agt": int(round(lev.get("C_part_agents", 0.15) / total * 100)),
                         "k_cap": round(float(lev.get("F_facteur_capital", 1.0)), 2),
+                        "k_taux": int(round(lev.get("G_choc_taux_pb", 0.0))),
+                        "k_mort": round(float(lev.get("H_choc_mortalite", 0.0)), 1),
+                        "k_lapse": round(float(lev.get("H_choc_decheance", 0.0)), 1),
+                        "k_morb": round(float(lev.get("H_choc_morbidite", 0.0)), 1),
 
                     }
                     if any(l.startswith("E_croiss_") and not l.startswith("E_croiss_couts")
