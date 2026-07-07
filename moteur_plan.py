@@ -412,6 +412,31 @@ def construire_lignes(res, params, scenario_id):
             params["g_attr"], params["g_na"])]
     return overlay, forecast, kpi, dim
 
+# ---- Rolling forecast : recalibration des leviers sur les réels ---------------------
+# Des « réels » synthétiques divergent progressivement du plan ; à chaque date de
+# coupure, l'information accumulée croît -> l'ajustement des leviers implicites aussi.
+# Principe démontré : rolling forecast = baseline immuable + NOUVEL overlay recalibré.
+COUPURES_RF = {
+    "Fin 2025":  {"intensite": 0.50, "annee_x": 2025.92},
+    "Mi-2026":   {"intensite": 0.75, "annee_x": 2026.50},
+    "Fin 2026":  {"intensite": 1.00, "annee_x": 2026.92},
+}
+NARRATIF_RF = ("Les réels montrent : ventes sous le plan (pression concurrentielle sur "
+               "les temporaires), coûts TI et Distribution au-dessus (projets de "
+               "modernisation), rendement des actions au-dessus (marchés favorables).")
+
+def params_rolling_forecast(coupure):
+    """Leviers implicites recalibrés sur les réels observés à la date de coupure.
+    Retourne (params_rf, narratif, position_x_de_la_coupure)."""
+    k = COUPURES_RF[coupure]["intensite"]
+    p = {kk: (list(v) if isinstance(v, list) else v) for kk, v in PARAMS_BASE.items()}
+    p["fact_volume"] = round(1.0 - 0.045 * k, 3)                 # ventes sous le plan
+    p["croiss_categories"][7] = round(p["croiss_categories"][7] + 1.6 * k, 2)  # TI
+    p["croiss_categories"][1] = round(p["croiss_categories"][1] + 0.8 * k, 2)  # Distribution
+    p["rdt_classes"][1] = round(p["rdt_classes"][1] + 0.9 * k, 2)  # actions favorables
+    p["rendement"] = rendement_pondere(p["rdt_classes"])
+    return p, NARRATIF_RF, COUPURES_RF[coupure]["annee_x"]
+
 GROUPES_LEVIERS = [
     ("A · Volume", ["fact_volume"]),
     ("B · Familles", ["croiss_fam"]),

@@ -49,6 +49,7 @@ from moteur_plan import (
     VP_CATEGORIES, CAT_BASE_2025, ALLOC_CATEGORIES_VERS_BLOCS,
     CROISS_CATEGORIES_DEFAUT, generer_faits_par_onglet,
     attribution_par_levier, overlay_vers_params,
+    params_rolling_forecast, COUPURES_RF,
 )
 
 def etiqueter_points(ax, xs, ys, dec=0, couleur="#333333", dy=6):
@@ -492,8 +493,8 @@ def bloc_faits(cle, titre):
             st.markdown(f"- {fait}")
 
 # ---- Onglets ---------------------------------------------------------------------
-SECTIONS = ["📊 Tableau de bord", "🏛️ Capital", "💸 Coûts",
-            "🔁 Roll-forward CSM", "⚖️ Comparaison", "📄 Détail"]
+SECTIONS = ["📊 Tableau de bord", "🏛️ Capital", "💸 Coûts", "🔁 Roll-forward CSM",
+            "🔄 Rolling forecast", "⚖️ Comparaison", "📄 Détail"]
 st.session_state.setdefault("k_nav", SECTIONS[0])
 nav = st.radio("Navigation", SECTIONS, horizontal=True, key="k_nav",
                label_visibility="collapsed")
@@ -679,6 +680,98 @@ if nav == "🔁 Roll-forward CSM":
         "Intérêt (M$)": res["csm_interet"].round(0),
         "Solde fin (M$)": res["csm_close"].round(0),
     }), hide_index=True, width="stretch")
+
+if nav == "🔄 Rolling forecast":
+    st.markdown(
+        "**Rolling forecast — recalibration du plan sur les réels** &nbsp;·&nbsp; "
+        "1️⃣ des *réels synthétiques* divergent du plan → 2️⃣ on en déduit les "
+        "**leviers implicites** (volume, coûts, rendement) → 3️⃣ la re-projection "
+        "s'écrit comme un **nouveau scénario overlay** — la baseline ne bouge jamais.")
+    coupure = st.selectbox("Réels observés jusqu'à :", list(COUPURES_RF.keys()),
+                           index=2, key="k_rf_coupure")
+    params_rf, narratif_rf, x_coupure = params_rolling_forecast(coupure)
+    res_rf = calculer_scenario(f"RF {coupure}", **params_rf)
+    st.caption(f"📋 {narratif_rf}")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Atterrissage — Résultat net 2030",
+              fmt_m(res_rf["resultat_net"][-1]),
+              delta=fmt_m(res_rf["resultat_net"][-1] - res_base["resultat_net"][-1])
+                    + " vs plan")
+    c2.metric("Atterrissage — RSI 2030", fmt_pct(res_rf["rsi_global"][-1]),
+              delta=fmt_fr(res_rf["rsi_global"][-1] - res_base["rsi_global"][-1], 1,
+                           " pt vs plan"))
+    c3.metric("Ventes 2030 (K$)", fmt_fr(res_rf["ventes_scen"][:, -1].sum()),
+              delta=fmt_fr(res_rf["ventes_scen"][:, -1].sum()
+                           - res_base["ventes_scen"][:, -1].sum()) + " vs plan")
+
+    fig, axes = plt.subplots(1, 2, figsize=(13.5, 4.2))
+    for ax, (titre, cle, dec) in zip(axes, [("Résultat net (M$)", "resultat_net", 0),
+                                            ("RSI global (%)", "rsi_global", 1)]):
+        ax.plot(ANNEES, res_base[cle], marker="o", linewidth=2, color=COUL["gris"],
+                linestyle="--", label="Plan (Base)")
+        ax.plot(ANNEES, res_rf[cle], marker="o", linewidth=2.6, color=COUL["vert"],
+                label=f"Rolling forecast ({coupure})")
+        etiqueter_points(ax, [ANNEES[-1]], [res_base[cle][-1]], dec=dec,
+                         couleur=COUL["gris"])
+        etiqueter_points(ax, [ANNEES[-1]], [res_rf[cle][-1]], dec=dec,
+                         couleur=COUL["vert"])
+        ax.axvline(x_coupure, color=COUL["rouge"], linewidth=1.4, linestyle=":")
+        ax.axvspan(ANNEES[0] - 0.2, x_coupure, color="#000000", alpha=0.05)
+        ax.text(x_coupure, ax.get_ylim()[1], " coupure ", color=COUL["rouge"],
+                fontsize=8.5, ha="center", va="top",
+                bbox=dict(facecolor="white", edgecolor=COUL["rouge"], boxstyle="round"))
+        ax.set_title(titre + " — zone grisée = réels")
+        ax.set_xticks(ANNEES)
+        ax.legend(fontsize=9)
+    fig.tight_layout()
+    afficher_fig(fig)
+
+    annees_reelles = [a for a in ANNEES if a < x_coupure]
+    if annees_reelles:
+        lignes_var = []
+        for a in annees_reelles:
+            ja = ANNEES.index(a)
+            partiel = " (partielle)" if x_coupure - a < 1 else ""
+            lignes_var.append({
+                "Période": f"{a}{partiel}",
+                "Ventes plan (K$)": round(float(res_base["ventes_scen"][:, ja].sum())),
+                "Ventes réelles (K$)": round(float(res_rf["ventes_scen"][:, ja].sum())),
+                "Écart ventes (%)": round((res_rf["ventes_scen"][:, ja].sum()
+                                           / res_base["ventes_scen"][:, ja].sum() - 1)
+                                          * 100, 1),
+                "Net plan (M$)": round(float(res_base["resultat_net"][ja]), 1),
+                "Net réel (M$)": round(float(res_rf["resultat_net"][ja]), 1),
+            })
+        st.markdown("**Réels vs plan (périodes écoulées)**")
+        st.dataframe(pd.DataFrame(lignes_var), hide_index=True, width="stretch")
+
+    net_b, et_rf, dl_rf, net_c = attribution_par_levier(params_rf, jf)
+    afficher_fig(fig_waterfall(
+        ["Net plan"] + et_rf + ["Net RF"],
+        [net_b] + dl_rf + [net_c],
+        f"Atterrissage {annee_focus} révisé : attribution par levier implicite "
+        f"({fmt_m(net_c - net_b, 1)} vs plan)"))
+    st.info("💡 Lecture pour la salle : l'atterrissage **tient**, mais pour de "
+            "*mauvaises raisons* — le rendement des marchés compense des ventes sous "
+            "le plan et des coûts TI en dérive. Sans le vent de dos des marchés, le "
+            "plan serait en retard : c'est exactement ce que le rolling forecast rend "
+            "visible avant la fin de l'année.")
+
+    if conn_ok:
+        if st.button(f"💾 Écrire « RF {coupure} » comme scénario", key="k_rf_ecrire"):
+            try:
+                with st.spinner("Write-back du rolling forecast…"):
+                    nb_l = ecrire_scenario(res_rf, params_rf, f"RF {coupure}",
+                                           CATALOG, SCHEMA)
+                lire_kpi_scenarios.clear()
+                st.success(f"✅ « RF {coupure} » écrit ({nb_l} lignes) — visible dans "
+                           f"la Comparaison et interrogeable par Genie.")
+            except Exception as e:
+                st.error(f"Échec du write-back : {e}")
+    else:
+        st.caption("🔌 Mode local : connecter le SQL warehouse pour écrire le RF "
+                   "comme scénario.")
 
 if nav == "⚖️ Comparaison":
     st.markdown(f"**Explication de l'écart vs « Base » par levier — résultat net "
