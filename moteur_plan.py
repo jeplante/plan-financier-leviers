@@ -177,7 +177,7 @@ VENTES_BASE = ventes_baseline()
 
 def calculer_scenario(scenario_id, fact_volume, croiss_fam, parts_canal,
                       rendement, g_acq, g_attr, g_na, rdt_classes=None,
-                      croiss_categories=None):
+                      croiss_categories=None, facteur_capital=1.0):
     """croiss_fam : ajustement de croissance PAR FAMILLE, en points de %/an vs le plan
     (ex. +2.0 -> la famille croît 2 pts plus vite chaque année que sa trajectoire de base).
     rdt_classes : rendements par classe d'actifs (%) — informatif ; le calcul utilise
@@ -245,7 +245,11 @@ def calculer_scenario(scenario_id, fact_volume, croiss_fam, parts_canal,
         couts_avant = ALLOC_BLOCS_VERS_CATEGORIES.T @ couts_blocs
     depenses_src = -(attr + na + 0.30 * acq)
 
-    capital = np.linspace(464.0, 581.0, N) * ECHELLE * (0.85 + 0.15 * fact_volume)
+    # Levier F : optimisation du capital (réassurance, ALM, redéploiement) —
+    # réduit le capital à rémunérer, ses coussins ET les actifs adossés (donc le
+    # résultat financier baisse un peu, mais le RSI monte : dénominateur plus petit).
+    capital = (np.linspace(464.0, 581.0, N) * ECHELLE
+               * (0.85 + 0.15 * fact_volume) * facteur_capital)
     actifs = capital * 5.6
     # Décomposition du capital par catégorie de coussin (poids constants, hypothèse)
     capital_coussins = POIDS_COUSSINS[:, None] * capital[None, :]        # (6 x années)
@@ -290,7 +294,8 @@ PARAMS_BASE = dict(fact_volume=1.0, croiss_fam=[0.0] * len(PRODUITS),
                    rendement=rendement_pondere(RDT_CLASSES_DEFAUT),   # ≈ 3,51 %
                    rdt_classes=list(RDT_CLASSES_DEFAUT),
                    g_acq=0.035, g_attr=0.030, g_na=0.020,
-                   croiss_categories=[round(float(g), 4) for g in CROISS_CATEGORIES_DEFAUT])
+                   croiss_categories=[round(float(g), 4) for g in CROISS_CATEGORIES_DEFAUT],
+                   facteur_capital=1.0)
 
 def construire_lignes(res, params, scenario_id):
     """Prépare les lignes overlay / forecast / kpi / dim (mêmes formats que Phase 1)."""
@@ -351,6 +356,8 @@ def construire_lignes(res, params, scenario_id):
             (c, res["couts_avant"][i]) for i, c in enumerate(CATEGORIES_COUTS)
         ],
     }
+    overlay.append((scenario_id, "F_facteur_capital",
+                    float(params.get("facteur_capital", 1.0)), 1.00, horo))
     # Levier E pré-allocation : une ligne d'overlay par catégorie/VP (si fourni)
     if params.get("croiss_categories"):
         for i, cat in enumerate(CATEGORIES_COUTS):
@@ -405,6 +412,66 @@ def construire_lignes(res, params, scenario_id):
             params["g_attr"], params["g_na"])]
     return overlay, forecast, kpi, dim
 
+GROUPES_LEVIERS = [
+    ("A · Volume", ["fact_volume"]),
+    ("B · Familles", ["croiss_fam"]),
+    ("C · Mix canal", ["parts_canal"]),
+    ("D · Rendement", ["rendement", "rdt_classes"]),
+    ("E · Coûts VP", ["croiss_categories", "g_acq", "g_attr", "g_na"]),
+    ("F · Capital", ["facteur_capital"]),
+]
+
+def attribution_par_levier(params_cible, jf, params_base=None):
+    """Décompose l'écart de résultat net (année d'indice jf) entre la baseline et un
+    scénario cible, levier par levier (application séquentielle A -> F ; les effets
+    d'interaction sont portés par l'ordre d'application)."""
+    base = dict(params_base or PARAMS_BASE)
+    net_prec = calculer_scenario("_attr", **base)["resultat_net"][jf]
+    net_base = net_prec
+    etiquettes, deltas = [], []
+    courant = dict(base)
+    for nom, cles in GROUPES_LEVIERS:
+        for c in cles:
+            if c in params_cible:
+                courant[c] = params_cible[c]
+        net = calculer_scenario("_attr", **courant)["resultat_net"][jf]
+        etiquettes.append(nom)
+        deltas.append(float(net - net_prec))
+        net_prec = net
+    return float(net_base), etiquettes, deltas, float(net_prec)
+
+def overlay_vers_params(lev):
+    """Reconstruit un dict de params moteur depuis les lignes d'overlay {levier: valeur}
+    d'un scénario écrit (gère les scénarios hérités avec valeurs par défaut)."""
+    parts = np.array([lev.get("C_part_independants", 0.60),
+                      lev.get("C_part_desjardins", 0.25),
+                      lev.get("C_part_agents", 0.15)])
+    parts = parts / parts.sum()
+    if any(k.startswith("E_croiss_") and not k.startswith("E_croiss_couts") for k in lev):
+        cc = [lev.get(f"E_croiss_{c}", CROISS_CATEGORIES_DEFAUT[i] / 100.0) * 100
+              for i, c in enumerate(CATEGORIES_COUTS)]
+    else:
+        g_b = np.array([lev.get("E_croiss_couts_acquisition", 0.035),
+                        lev.get("E_croiss_couts_attribuables", 0.030),
+                        lev.get("E_croiss_couts_non_attrib", 0.020)])
+        cc = (ALLOC_CATEGORIES_VERS_BLOCS @ g_b * 100).tolist()
+    if any(k.startswith("D_rdt_") for k in lev):
+        rc = [lev.get(f"D_rdt_{cl}", RDT_CLASSES_DEFAUT[i] / 100.0) * 100
+              for i, cl in enumerate(CLASSES_ACTIFS)]
+    else:
+        ratio = lev.get("D_rendement_placement", rendement_pondere(RDT_CLASSES_DEFAUT)) \
+                / rendement_pondere(RDT_CLASSES_DEFAUT)
+        rc = [d * ratio for d in RDT_CLASSES_DEFAUT]
+    return dict(
+        fact_volume=float(lev.get("A_facteur_volume", 1.0)),
+        croiss_fam=[float(lev.get(f"B_croiss_{p}", 0.0)) for p in PRODUITS],
+        parts_canal=parts.tolist(),
+        rendement=rendement_pondere(rc), rdt_classes=rc,
+        croiss_categories=[float(x) for x in cc],
+        g_acq=0.035, g_attr=0.030, g_na=0.020,
+        facteur_capital=float(lev.get("F_facteur_capital", 1.0)),
+    )
+
 def generer_faits_par_onglet(res, res_base, params, jf, annee_focus, scenario_id):
     """Faits saillants générés automatiquement, organisés PAR ONGLET de l'app.
     Alternative légère et 100 % fiable en démo à un Genie embarqué."""
@@ -419,6 +486,7 @@ def generer_faits_par_onglet(res, res_base, params, jf, annee_focus, scenario_id
                                 abs(params["parts_canal"][1] - 0.25),
                                 abs(params["parts_canal"][2] - 0.15)) / 0.05,
         "le rendement de placement (D)": abs(params["rendement"] - 0.035) / 0.0025,
+        "l'optimisation du capital (F)": abs(params.get("facteur_capital", 1.0) - 1.0) / 0.02,
         "les coûts pré-allocation (E)": (
             max(abs(params["croiss_categories"][i] - CROISS_CATEGORIES_DEFAUT[i])
                 for i in range(len(CATEGORIES_COUTS))) / 0.5
@@ -495,11 +563,20 @@ def generer_faits_par_onglet(res, res_base, params, jf, annee_focus, scenario_id
             f"({VP_CATEGORIES[i_rapide]}) à {fmt_fr(g[i_rapide], 1)} %/an — se propage "
             f"aux blocs post-allocation et au RSI.")
 
+    depasse = np.where(res["nb_csm"] > res["csm_release"])[0]
+    if len(depasse):
+        fait_croisement = (f"⚔️ L'impact des ventes profitables dépasse la relâche du "
+                           f"profit attendu dès **{2025 + int(depasse[0])}** — le stock "
+                           f"de CSM se reconstitue plus vite qu'il ne se consomme.")
+    else:
+        fait_croisement = ("⚔️ La relâche du profit attendu dépasse l'impact des ventes "
+                           "profitables sur tout l'horizon : le stock de CSM se consomme.")
+
     return {
         "tableau_de_bord": faits[:3],
         "capital": faits_capital,
         "couts": faits_couts,
-        "csm": [faits[3]],
+        "csm": [faits[3], fait_croisement],
     }
 
 def generer_faits_saillants(res, res_base, params, jf, annee_focus, scenario_id):

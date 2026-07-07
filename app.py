@@ -48,6 +48,7 @@ from moteur_plan import (
     rendement_pondere, ORACLE_MAPPING, MOIS, PROFILS_MENSUELS, mensualiser,
     VP_CATEGORIES, CAT_BASE_2025, ALLOC_CATEGORIES_VERS_BLOCS,
     CROISS_CATEGORIES_DEFAUT, generer_faits_par_onglet,
+    attribution_par_levier, overlay_vers_params,
 )
 
 def etiqueter_points(ax, xs, ys, dec=0, couleur="#333333", dy=6):
@@ -294,20 +295,6 @@ st.title("📊 Plan financier simplifié par leviers — Assurance individuelle"
 st.caption("⚠️ **Données synthétiques à des fins de démonstration** · IFRS 17 · "
            "2025 (estimé) → 2030 · POC Databricks App")
 
-# ---- 🧭 Démarche (storyline mise en évidence, façon SUMMARY/STORYLINE) ----------
-_etapes = ["1️⃣ Ventes d'affaires nouvelles", "2️⃣ CSM des ventes + VAN",
-           "3️⃣ État des résultats IFRS 17", "4️⃣ Capital à rémunérer",
-           "5️⃣ RSI (ROE)", "6️⃣ Sources de bénéfices", "7️⃣ Roll-forward CSM",
-           "🎛️ Leviers → recalcul"]
-st.markdown(
-    "<div style='background:#EAF3EE;border-left:6px solid #00874E;border-radius:6px;"
-    "padding:10px 14px;margin-bottom:6px;'>"
-    "<b>🧭 Démarche</b> &nbsp;·&nbsp; " +
-    " <span style='color:#00874E;font-weight:bold'>→</span> ".join(
-        f"<span style='white-space:nowrap'>{e}</span>" for e in _etapes) +
-    "</div>",
-    unsafe_allow_html=True,
-)
 with st.expander("Voir le détail de la démarche (passifs / actifs / consolidé)"):
     st.markdown("""
 | Bloc | Approche | Outil |
@@ -326,6 +313,7 @@ FAMILLES_COURTES = ["VE participation", "VE paiements limités", "Autres VE",
                     "Temporaires", "Maladies graves", "Autres inv. et maladie"]
 CLES_B = [f"k_b_{i}" for i in range(len(PRODUITS))]
 CLES_DEFAUTS = {"k_scen": "Base", "k_vol": 1.00, "k_ind": 60, "k_dsj": 25, "k_agt": 15,
+                "k_cap": 1.00,
                 **{f"k_e_{i}": round(float(CROISS_CATEGORIES_DEFAUT[i]), 1)
                    for i in range(len(CATEGORIES_COUTS))},
                 **{f"k_rc_{i}": RDT_CLASSES_DEFAUT[i] for i in range(len(CLASSES_ACTIFS))},
@@ -372,6 +360,11 @@ with st.sidebar.expander("E — Coûts pré-allocation par VP (%/an)", expanded=
     croiss_cats = [st.slider(f"{CATEGORIES_COUTS[i]} · {VP_CATEGORIES[i]}",
                              0.0, 8.0, step=0.1, key=f"k_e_{i}")
                    for i in range(len(CATEGORIES_COUTS))]
+facteur_capital = st.sidebar.slider("F — Optimisation du capital (×)", 0.80, 1.10,
+                                    step=0.01, key="k_cap",
+                                    help="Réassurance, ALM, redéploiement : réduit le "
+                                         "capital à rémunérer et ses coussins (le RSI "
+                                         "monte, le résultat financier baisse un peu).")
 # Taux de blocs post-allocation DÉRIVÉS (traçabilité dim_scenario_gld)
 _cat30 = CAT_BASE_2025 * (1 + np.array(croiss_cats) / 100.0) ** 5
 _b25 = ALLOC_CATEGORIES_VERS_BLOCS.T @ CAT_BASE_2025
@@ -382,6 +375,7 @@ params = dict(fact_volume=float(fact_volume), croiss_fam=[float(c) for c in croi
               parts_canal=[float(p) for p in parts_canal], rendement=float(rendement),
               rdt_classes=[float(r) for r in rdt_classes],
               croiss_categories=[float(c) for c in croiss_cats],
+              facteur_capital=float(facteur_capital),
               g_acq=float(g_acq), g_attr=float(g_attr), g_na=float(g_na))
 
 # ---- Recalcul instantané (moment « wow » A) ------------------------------------
@@ -426,6 +420,7 @@ if conn_ok:
                         "k_ind": int(round(lev.get("C_part_independants", 0.60) / total * 100)),
                         "k_dsj": int(round(lev.get("C_part_desjardins", 0.25) / total * 100)),
                         "k_agt": int(round(lev.get("C_part_agents", 0.15) / total * 100)),
+                        "k_cap": round(float(lev.get("F_facteur_capital", 1.0)), 2),
 
                     }
                     if any(l.startswith("E_croiss_") and not l.startswith("E_croiss_couts")
@@ -547,6 +542,19 @@ with ong_cap:
                 label="Capital net à rémunérer", zorder=4)
         etiqueter_totaux(ax, ANNEES, bas)                       # sommet des coussins bruts
         etiqueter_points(ax, ANNEES, res["capital"], dy=-14)   # capital net
+        bas_seg = np.zeros(N)   # étiquettes de segment (si assez hauts pour être lisibles)
+        for i2 in range(len(COUSSINS)):
+            if POIDS_COUSSINS[i2] >= 0:
+                for x2, (v2, b2) in enumerate(zip(cc[i2], bas_seg)):
+                    if v2 > bas.max() * 0.055:
+                        ax.text(ANNEES[x2], b2 + v2 / 2, fmt_fr(v2), ha="center",
+                                va="center", fontsize=7.2, color="white",
+                                fontweight="bold")
+                bas_seg += cc[i2]
+            else:
+                for x2, v2 in enumerate(cc[i2]):
+                    ax.text(ANNEES[x2], v2 / 2, fmt_fr(v2), ha="center", va="center",
+                            fontsize=7.2, color="white", fontweight="bold")
         ax.axhline(0, color=COUL["gris"], linewidth=0.8)
         ax.set_title("Empilement des coussins et capital net (M$)")
         ax.set_xticks(ANNEES)
@@ -560,6 +568,17 @@ with ong_cap:
             COUSSINS + ["Capital net"], vals_cap,
             f"Composition du capital {annee_focus} (M$)",
             plafond=float(cc[:5, jf].sum()) * 1.2))
+    fig, ax = plt.subplots(figsize=(12.5, 3.4))
+    ax.plot(ANNEES, res["rsi_global"], marker="o", linewidth=2.5, color=COUL["bleu"],
+            label="RSI global (ROE)")
+    ax.plot(ANNEES, res_base["rsi_global"], marker="o", linewidth=1.8, color=COUL["gris"],
+            linestyle="--", label="Base")
+    etiqueter_points(ax, ANNEES, res["rsi_global"], dec=1, couleur=COUL["bleu"])
+    ax.set_title("ROE — résultat net / capital à rémunérer moyen (%)")
+    ax.set_xticks(ANNEES)
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+    afficher_fig(fig)
     bloc_faits("capital", "Capital")
     tbl_cap = pd.DataFrame(cc.round(0), index=COUSSINS,
                            columns=[str(a) for a in ANNEES])
@@ -595,7 +614,7 @@ with ong_cout:
                     color=[COUL["bleu"], COUL["vert"], COUL["or"]][k], label=b)
             etiqueter_points(ax, ANNEES, res["couts_blocs"][k],
                              couleur=[COUL["bleu"], COUL["vert"], COUL["or"]][k])
-        ax.set_title("Blocs POST-allocation dérivés (M$)")
+        ax.set_title("Coûts par catégorie IFRS 17 (M$) — dérivés de l'allocation")
         ax.set_xticks(ANNEES)
         ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: fmt_fr(x)))
         ax.legend(fontsize=8.5)
@@ -632,6 +651,21 @@ with ong2:
         [depart] + flux + [res["csm_close"][jf]],
         f"Roll-forward du CSM {suff_csm} — « {scenario_id} » (M$)",
         plafond=max(depart, res["csm_close"][jf]) * 1.18))
+    fig, ax = plt.subplots(figsize=(12.5, 3.8))
+    larg = 0.38
+    x_pos = np.arange(N)
+    ax.bar(x_pos - larg / 2, res["csm_release"], larg, color=COUL["rouge"],
+           label="Relâche du profit attendu (consommation)", zorder=3)
+    ax.bar(x_pos + larg / 2, res["nb_csm"], larg, color=COUL["vert"],
+           label="Impact des ventes profitables (reconstitution)", zorder=3)
+    etiqueter_points(ax, x_pos - larg / 2, res["csm_release"], couleur=COUL["rouge"], dy=3)
+    etiqueter_points(ax, x_pos + larg / 2, res["nb_csm"], couleur=COUL["vert"], dy=3)
+    ax.set_xticks(x_pos, [str(a) for a in ANNEES])
+    ax.set_title("Consommation vs reconstitution du CSM (M$) — le croisement des barres "
+                 "indique quand le stock se remet à croître")
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+    afficher_fig(fig)
     st.dataframe(pd.DataFrame({
         "Année": ANNEES,
         "Solde départ (M$)": res["csm_open"].round(0),
@@ -659,12 +693,30 @@ with ong_mois:
     }
     choix_m = c_sel2.selectbox("Ligne à mensualiser", list(series_m.keys()), key="k_m_serie")
     serie_ann, profil_defaut, dec_m = series_m[choix_m]
-    profil_m = c_sel3.selectbox("Profil de saisonnalité", list(PROFILS_MENSUELS.keys()),
-                                index=list(PROFILS_MENSUELS.keys()).index(profil_defaut),
+    options_profils = list(PROFILS_MENSUELS.keys()) + ["Personnalisé (saisie par mois)"]
+    profil_m = c_sel3.selectbox("Profil de saisonnalité", options_profils,
+                                index=options_profils.index(profil_defaut),
                                 key="k_m_profil")
-    intensite = c_sel4.slider("Intensité du profil", 0.0, 1.0, 1.0, 0.05, key="k_m_int")
-
-    mens = mensualiser(serie_ann[jm], profil_m, intensite)
+    if profil_m.startswith("Personnalisé"):
+        c_sel4.caption("Intensité : n/a (saisie directe)")
+        desc_profil = "profil personnalisé (saisie par mois)"
+        st.markdown("**Poids mensuels (%)** — saisis librement, renormalisés à 100 % :")
+        defaut_pers = pd.DataFrame(
+            {m: [round(float(p * 100), 1)] for m, p in
+             zip(MOIS, PROFILS_MENSUELS["Saisonnalité ventes (REER + automne)"])})
+        saisie = st.data_editor(defaut_pers, hide_index=True, width="stretch",
+                                key="k_m_saisie", num_rows="fixed")
+        poids_pers = np.clip(saisie.iloc[0].to_numpy(dtype=float), 0.0, None)
+        if poids_pers.sum() <= 0:
+            poids_pers = np.full(12, 1.0)
+        poids_pers = poids_pers / poids_pers.sum()
+        st.caption("Somme saisie : " + fmt_fr(float(saisie.iloc[0].sum()), 1, " %")
+                   + " → renormalisée à 100 %.")
+        mens = float(serie_ann[jm]) * poids_pers
+    else:
+        intensite = c_sel4.slider("Intensité du profil", 0.0, 1.0, 1.0, 0.05, key="k_m_int")
+        desc_profil = f"profil « {profil_m} » (intensité {intensite:.0%})"
+        mens = mensualiser(serie_ann[jm], profil_m, intensite)
     cum = np.cumsum(mens)
 
     # Panneau sombre à barres vertes + ligne de cumul (inspiré du visuel fourni)
@@ -688,8 +740,7 @@ with ong_mois:
     ax.set_xticks(range(12), MOIS)
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: fmt_fr(x, dec_m)))
     ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: fmt_fr(x, dec_m)))
-    ax.set_title(f"{choix_m} — {annee_m} · profil « {profil_m} » (intensité "
-                 f"{intensite:.0%}) · scénario « {scenario_id} »",
+    ax.set_title(f"{choix_m} — {annee_m} · {desc_profil} · scénario « {scenario_id} »",
                  color="white", fontsize=12.5, fontweight="bold")
     l1, e1 = ax.get_legend_handles_labels()
     l2, e2 = ax2.get_legend_handles_labels()
@@ -716,7 +767,34 @@ with ong_mois:
                "dans une table Gold (`forecast_mensuel_gld`) pour Genie et Power BI.")
 
 with ong3:
-
+    st.markdown(f"**Explication de l'écart vs « Base » par levier — résultat net "
+                f"{annee_focus} (M$)**")
+    options_attr = ["Scénario courant (curseurs)"]
+    overlays_attr = {}
+    if conn_ok:
+        try:
+            ov_all = requete(
+                f"SELECT scenario_id, levier, valeur FROM "
+                f"{qualifier('overlay_drivers_slv', CATALOG, SCHEMA)} "
+                f"WHERE scenario_id <> 'Base'")
+            for sc in sorted(ov_all["scenario_id"].unique()):
+                d_sc = ov_all[ov_all["scenario_id"] == sc]
+                overlays_attr[sc] = dict(zip(d_sc["levier"],
+                                             d_sc["valeur"].astype(float)))
+            options_attr += list(overlays_attr.keys())
+        except Exception:
+            pass
+    choix_attr = st.selectbox("Scénario à expliquer", options_attr, key="k_attr")
+    params_attr = (params if choix_attr.startswith("Scénario courant")
+                   else overlay_vers_params(overlays_attr[choix_attr]))
+    nom_attr = scenario_id if choix_attr.startswith("Scénario courant") else choix_attr
+    net_b, et_attr, dl_attr, net_c = attribution_par_levier(params_attr, jf)
+    afficher_fig(fig_waterfall(
+        ["Net « Base »"] + et_attr + [f"Net « {nom_attr} »"],
+        [net_b] + dl_attr + [net_c],
+        f"Écart de résultat net {annee_focus} : « Base » → « {nom_attr} » "
+        f"({fmt_m(net_c - net_b, 1)}) — attribution séquentielle A → F"))
+    st.divider()
     st.markdown("**Scénarios écrits dans `kpi_gld`** (notebook Phase 1 ou bouton "
                 "« Écrire le scénario »). Le scénario courant *(non écrit)* est superposé "
                 "en pointillé.")
