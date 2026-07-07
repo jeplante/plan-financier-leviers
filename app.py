@@ -23,6 +23,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+import matplotlib.patches as mpatches
 
 # Connecteur Databricks (présent dans l'app ; absent en test local -> mode local)
 try:
@@ -296,19 +297,6 @@ st.title("📊 Plan financier simplifié par leviers — Assurance individuelle"
 st.caption("⚠️ **Données synthétiques à des fins de démonstration** · IFRS 17 · "
            "2025 (estimé) → 2030 · POC Databricks App")
 
-with st.expander("Voir le détail de la démarche (passifs / actifs / consolidé)"):
-    st.markdown("""
-| Bloc | Approche | Outil |
-|---|---|---|
-| **Passifs — In-force** | Baseline synthétique du bloc en vigueur (relâche CSM + RA, expérience), agrégée au niveau des 6 familles de produits | Delta (médaillon) |
-| **Passifs — Affaires nouvelles** | Ventes par famille × canal → marge CSM et VAN@12 % ; leviers de volume (A), de croissance par famille (B) et de mix canal (C) en overlay | Moteur pandas |
-| **Combiné (In-force + AN)** | Alimente sans couture l'état des résultats IFRS 17 et le roll-forward du CSM | Moteur pandas |
-| **Actifs** | Résultat financier ≈ actifs investis × rendement (levier D) − accrétion des passifs | Moteur pandas |
-| **Consolidé** | Capital à rémunérer → RSI (ROE), sources de bénéfices, coûts unitaires (levier E) ; write-back par scénario dans le Gold | Delta + app |
-
-**Principe clé : baseline immuable + overlay de leviers → recalcul du Gold par scénario.**
-""")
-
 # ---- Clés des widgets (permettent le rechargement d'un scénario écrit) ---------
 FAMILLES_COURTES = ["VE participation", "VE paiements limités", "Autres VE",
                     "Temporaires", "Maladies graves", "Autres inv. et maladie"]
@@ -512,9 +500,9 @@ def bloc_faits(cle, titre):
             st.markdown(f"- {fait}")
 
 # ---- Onglets ---------------------------------------------------------------------
-SECTIONS = ["📊 Tableau de bord", "🏛️ Capital", "💸 Coûts", "🔁 Roll-forward CSM",
-            "🔄 Rolling forecast", "⚖️ Comparaison", "📄 Détail"]
-st.session_state.setdefault("k_nav", SECTIONS[0])
+SECTIONS = ["🧭 Démarche", "📊 Tableau de bord", "🏛️ Capital", "💸 Coûts",
+            "🔁 Roll-forward CSM", "🔄 Rolling forecast", "⚖️ Comparaison", "📄 Détail"]
+st.session_state.setdefault("k_nav", "📊 Tableau de bord")
 nav = st.radio("Navigation", SECTIONS, horizontal=True, key="k_nav",
                label_visibility="collapsed")
 # Navigation persistante : contrairement à st.tabs, la sélection survit aux reruns
@@ -525,6 +513,89 @@ st.divider()
 def valeurs_vue(series_list, jf, cumulatif):
     """Vue annuelle (valeur de l'année focus) ou cumulative (somme 2025 -> focus)."""
     return [float(np.sum(s[:jf + 1])) if cumulatif else float(s[jf]) for s in series_list]
+
+if nav == "🧭 Démarche":
+    GRIS_FL = "#8C8C8C"
+    def _boite(ax, cx, cy, w, h, titre, sous, fc, ec, tc, fs=13):
+        ax.add_patch(mpatches.FancyBboxPatch(
+            (cx - w / 2, cy - h / 2), w, h, boxstyle="round,pad=0.4,rounding_size=1.2",
+            facecolor=fc, edgecolor=ec, linewidth=1.6, zorder=3))
+        ax.text(cx, cy + (h * 0.16 if sous else 0), titre, ha="center", va="center",
+                fontsize=fs, fontweight="bold", color=tc, zorder=4)
+        if sous:
+            ax.text(cx, cy - h * 0.24, sous, ha="center", va="center",
+                    fontsize=fs - 2.5, color=tc, zorder=4)
+
+    def _fleche(ax, x1, y1, x2, y2):
+        ax.annotate("", (x2, y2), (x1, y1), zorder=2,
+                    arrowprops=dict(arrowstyle="-|>", color=GRIS_FL, lw=1.8,
+                                    shrinkA=0, shrinkB=0))
+
+    def _ligne(ax, pts):
+        ax.plot([p[0] for p in pts], [p[1] for p in pts],
+                color=GRIS_FL, lw=1.8, zorder=2)
+
+    fig, ax = plt.subplots(figsize=(12.5, 10))
+    ax.set_xlim(0, 100); ax.set_ylim(0, 100)
+    ax.axis("off"); ax.set_facecolor("white"); fig.patch.set_facecolor("white")
+
+    VIO = ("#EAE8FB", "#5B4FC0", "#3F3799")
+    VER = ("#EDF6E4", "#5B8C2A", "#3E6B1F")
+    TEA = ("#E3F2EC", "#1E7A55", "#14563C")
+    BEI = ("#EFEDE6", "#8A857A", "#4A463E")
+
+    ax.text(50, 98, "Travail actuariel déjà réalisé pour le FCT",
+            ha="center", fontsize=12.5, color="#555555")
+
+    _boite(ax, 50, 91.5, 44, 8, "Modèle de projection Axis", "construit pour le FCT", *VIO)
+    _ligne(ax, [(50, 87.5), (50, 85), (27, 85)]); _fleche(ax, 27, 85, 27, 82.5)
+    _ligne(ax, [(50, 85), (73, 85)]); _fleche(ax, 73, 85, 73, 82.5)
+    _boite(ax, 27, 78, 40, 8.5, "Chocs d'assurance", "mortalité · déchéance · morbidité", *VIO)
+    _boite(ax, 73, 78, 40, 8.5, "Chocs financiers", "taux d'intérêt · rendements", *VIO)
+    _ligne(ax, [(27, 73.7), (27, 71.5), (50, 71.5)])
+    _ligne(ax, [(73, 73.7), (73, 71.5), (50, 71.5)])
+    _fleche(ax, 50, 71.5, 50, 69.2)
+    _boite(ax, 50, 64.5, 66, 8.5, "Réutilisé tel quel pour le plan financier",
+           "aucune reprise actuarielle après le FCT", *VER)
+
+    # Conteneur Plateforme Données & IA
+    ax.add_patch(mpatches.FancyBboxPatch(
+        (3, 3), 94, 52, boxstyle="round,pad=0.4,rounding_size=1.5",
+        facecolor="none", edgecolor="#BBBBBB", linewidth=1.5,
+        linestyle=(0, (6, 4)), zorder=1))
+    ax.text(7, 52, "Plateforme Données & IA", fontsize=13.5, fontweight="bold",
+            color="#333333")
+
+    _ligne(ax, [(50, 60.2), (50, 57.5), (20, 57.5)]); _fleche(ax, 20, 57.5, 20, 49.5)
+    _fleche(ax, 50, 57.5, 50, 49.5)
+    _ligne(ax, [(50, 57.5), (80, 57.5)]); _fleche(ax, 80, 57.5, 80, 49.5)
+    _boite(ax, 20, 45, 27, 8.5, "Passifs", "issus des sorties FCT", *BEI, fs=12.5)
+    _boite(ax, 50, 45, 27, 8.5, "Résultats financiers", "modèle simplifié", *TEA, fs=12.5)
+    _boite(ax, 80, 45, 27, 8.5, "Capital", "modèle simplifié", *TEA, fs=12.5)
+    _ligne(ax, [(20, 40.7), (20, 38), (50, 38)])
+    _ligne(ax, [(80, 40.7), (80, 38), (50, 38)])
+    _fleche(ax, 50, 38, 50, 35.2)
+    _boite(ax, 50, 30.5, 42, 8.5, "Leviers calibrés", "overlay · recalcul par scénario", *TEA)
+    _fleche(ax, 50, 26.2, 50, 22.5)
+    _boite(ax, 50, 16, 84, 10, "Médaillon → livrables",
+           "bronze → silver → gold · IFRS 17 · ROE · VAN · Genie", *BEI)
+
+    fig.tight_layout()
+    afficher_fig(fig)
+
+    with st.expander("Voir le détail par bloc (outil et approche)"):
+        st.markdown("""
+| Bloc | Approche | Outil |
+|---|---|---|
+| **Passifs — In-force** | Sorties du modèle Axis (FCT) : relâche CSM + RA, expérience, agrégées aux 6 familles | Delta (médaillon) |
+| **Passifs — Affaires nouvelles** | Ventes par famille × canal → marge CSM et VAN@12 % ; leviers A/B/C en overlay | Moteur pandas |
+| **Chocs actuariels & financiers** | Leviers G (taux, ALM adossé) et H (mortalité · déchéance · morbidité) réutilisant les chocs du FCT | Moteur pandas |
+| **Actifs** | Résultat financier ≈ actifs investis × rendement (levier D) − accrétion des passifs | Moteur pandas |
+| **Consolidé** | Capital par coussin (levier F) → RSI, sources de bénéfices, coûts par VP (levier E) | Delta + app |
+| **Rolling forecast** | Réels → leviers implicites → nouveau scénario overlay (baseline immuable) | Delta + app |
+""")
+    st.caption("⚠️ Données synthétiques à des fins de démonstration — aucune donnée "
+               "réelle de l'organisation.")
 
 if nav == "📊 Tableau de bord":
     bloc_faits("tableau_de_bord", f"« {scenario_id} » · {annee_focus}")
