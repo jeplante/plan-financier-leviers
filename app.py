@@ -282,15 +282,18 @@ st.set_page_config(page_title="Plan financier par leviers — Assurance individu
                    page_icon="📊", layout="wide")
 
 st.markdown("""<style>
-div[data-testid="stMetric"]{background:#FFFFFF;border:1px solid #E8E8E4;
-  border-radius:12px;padding:14px 18px;box-shadow:0 1px 3px rgba(0,0,0,.05);}
-div[data-testid="stMetric"] label{color:#7F8C8D;}
-div[data-testid="stVerticalBlockBorderWrapper"]{border-radius:12px;}
-button[data-baseweb="tab"]{border-radius:10px 10px 0 0;padding:8px 14px;}
-button[data-baseweb="tab"][aria-selected="true"]{background:#EAF3EE;
-  border-bottom:3px solid #00874E;font-weight:600;}
-div[role="radiogroup"] label{background:#FFFFFF;border:1px solid #E8E8E4;
+div[data-testid="stMetric"]{background:#FFFFFF;border:1px solid #E4E2DC;
+  border-radius:12px;padding:14px 18px;box-shadow:0 1px 3px rgba(27,49,57,.08);}
+div[data-testid="stMetric"] label{color:#6B7A80;}
+div[data-testid="stMetric"] [data-testid="stMetricValue"]{color:#1B3139;}
+div[data-testid="stVerticalBlockBorderWrapper"]{border-radius:12px;
+  border-color:#E4E2DC !important;}
+div[role="radiogroup"] label{background:#FFFFFF;border:1px solid #E4E2DC;
   border-radius:8px;padding:4px 12px;margin-right:6px;}
+div[role="radiogroup"] label:has(input:checked){background:#FFF1EF;
+  border:1px solid #FF3621;font-weight:600;}
+h1, h2, h3{color:#1B3139;}
+section[data-testid="stSidebar"]{background:#F9F7F4;}
 </style>""", unsafe_allow_html=True)
 
 st.title("📊 Plan financier simplifié par leviers — Assurance individuelle")
@@ -477,7 +480,8 @@ else:
                        "droits du principal de service sur le schéma.")
 
 # ---- Cartes KPI (avec écart vs Base) --------------------------------------------
-annee_focus = st.select_slider("Année mise en vedette", options=ANNEES, value=2030)
+st.session_state.setdefault("k_annee", 2030)
+annee_focus = st.selectbox("Année mise en vedette", ANNEES, key="k_annee")
 jf = ANNEES.index(annee_focus)
 
 c1, c2, c3, c4 = st.columns(4)
@@ -622,7 +626,7 @@ if nav == "🏛️ Capital":
     st.markdown(f"**Capital requis par catégorie de coussin — « {scenario_id} »** "
                 "*(poids par coussin : hypothèses de démonstration)*")
     cc = res["capital_coussins"]           # (6 coussins x années), Diversification < 0
-    couleurs_c = [COUL["bleu"], COUL["vert"], COUL["or"], "#8E44AD", "#16A085", COUL["rouge"]]
+    couleurs_c = [COUL["bleu"], COUL["vert"], COUL["or"], "#2272B4", "#0B5563", COUL["rouge"]]
     g1, g2 = st.columns([1.15, 1])
     with g1:
         fig, ax = plt.subplots(figsize=(8.5, 4.6))
@@ -687,8 +691,8 @@ if nav == "💸 Coûts":
                 f"*(« {scenario_id} » : chaque catégorie croît à son taux, puis "
                 f"s'alloue vers les blocs post-allocation → dépenses du P&L → RSI)*")
     ca = res["couts_avant"]                # (8 catégories x années)
-    couleurs_k = ["#1F5673", "#00874E", "#B8860B", "#8E44AD", "#16A085",
-                  "#C0392B", "#7F8C8D", "#2C3E50"]
+    couleurs_k = ["#1B3139", "#00A972", "#FFAB00", "#2272B4", "#0B5563",
+                  "#FF3621", "#6B7A80", "#98102A"]
     g1, g2 = st.columns([1.15, 1])
     with g1:
         fig, ax = plt.subplots(figsize=(8.5, 4.6))
@@ -904,7 +908,7 @@ if nav == "⚖️ Comparaison":
         kpi_all = pd.DataFrame(columns=["scenario_id", "annee", "kpi", "valeur"])
 
     scenarios = sorted(kpi_all["scenario_id"].unique()) if len(kpi_all) else []
-    couleurs = [COUL["bleu"], COUL["vert"], COUL["or"], COUL["rouge"], "#8E44AD", "#16A085"]
+    couleurs = [COUL["bleu"], COUL["vert"], COUL["or"], COUL["rouge"], "#2272B4", "#98102A"]
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.2))
     for ax, (kpi_nom, titre, cle_local) in zip(axes, [
         ("rsi_global_pct", "RSI global (%)", "rsi_global"),

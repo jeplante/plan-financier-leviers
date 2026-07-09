@@ -54,8 +54,9 @@ BASE_COUTS = np.array([95.0, 48.0, 14.6]) * ECHELLE   # acquisition / attribuabl
 # décalé des valeurs d'origine (≈ 4 034 $ -> 3 381 $ au lieu de 3 026 -> 2 536 $).
 POLICES_2025, POLICES_2030 = 52083.0 * 1.5, 72000.0 * 1.5
 
-COUL = {"vert": "#00874E", "rouge": "#C0392B", "bleu": "#1F5673",
-        "gris": "#7F8C8D", "or": "#B8860B", "fond": "#F7F7F5"}
+# Palette inspirée de la marque Databricks : Lava, Navy, vert, ambre, fonds Oat.
+COUL = {"vert": "#00A972", "rouge": "#FF3621", "bleu": "#1B3139",
+        "gris": "#6B7A80", "or": "#FFAB00", "fond": "#F9F7F4"}
 
 # ---- Capital requis par catégorie de coussin (HYPOTHÈSES de démonstration) -------
 # Poids appliqués au capital à rémunérer ; la diversification est négative. Somme = 1.
